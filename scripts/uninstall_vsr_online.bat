@@ -19,11 +19,13 @@ if not exist "%PS_SCRIPT%" (
 powershell -NoProfile -ExecutionPolicy Bypass -File "%PS_SCRIPT%" %*
 set "EXIT_CODE=%ERRORLEVEL%"
 
-if not "%EXIT_CODE%"=="0" (
-    echo.
+echo.
+if "%EXIT_CODE%"=="0" (
+    echo Uninstall completed successfully.
+) else (
     echo Uninstall failed. Exit code: %EXIT_CODE%
-    pause
 )
+pause
 
 exit /b %EXIT_CODE%
 
@@ -35,6 +37,8 @@ echo   uninstall_vsr_online.bat
 echo   uninstall_vsr_online.bat -Yes
 echo   uninstall_vsr_online.bat -InstallDir "D:\Apps\VSR_Online" -Yes
 echo   uninstall_vsr_online.bat -KeepDownloads
+echo.
+echo If -InstallDir is omitted, the PowerShell uninstaller prompts for an install directory.
 echo.
 pause
 exit /b 0

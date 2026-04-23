@@ -15,6 +15,40 @@ function Write-Step {
     Write-Host "==> $Message" -ForegroundColor Cyan
 }
 
+function Resolve-ScriptRoot {
+    if ($PSScriptRoot) {
+        return (Resolve-Path -LiteralPath $PSScriptRoot).Path
+    }
+    return (Get-Location).Path
+}
+
+function Resolve-DefaultInstallDir {
+    $scriptRoot = Resolve-ScriptRoot
+    $sourceDir = Split-Path -Parent $scriptRoot
+    $parentDir = Split-Path -Parent $sourceDir
+    return (Join-Path $parentDir "VSR_Online")
+}
+
+function Get-Text {
+    param([int[]]$CodePoints)
+    return -join ($CodePoints | ForEach-Object { [char]$_ })
+}
+
+function Read-UninstallDir {
+    param([string]$DefaultInstallDir)
+    $titleText = Get-Text @(0x8BF7, 0x9009, 0x62E9, 0x8981, 0x5378, 0x8F7D, 0x7684, 0x5B89, 0x88C5, 0x76EE, 0x5F55)
+    $defaultText = Get-Text @(0x9ED8, 0x8BA4, 0x76EE, 0x5F55)
+    $promptText = Get-Text @(0x76F4, 0x63A5, 0x56DE, 0x8F66, 0x4F7F, 0x7528, 0x9ED8, 0x8BA4, 0x76EE, 0x5F55, 0xFF0C, 0x6216, 0x8F93, 0x5165, 0x81EA, 0x5B9A, 0x4E49, 0x5B89, 0x88C5, 0x76EE, 0x5F55)
+    Write-Host ""
+    Write-Host $titleText
+    Write-Host "${defaultText}: $DefaultInstallDir"
+    $inputDir = Read-Host $promptText
+    if ([string]::IsNullOrWhiteSpace($inputDir)) {
+        return $DefaultInstallDir
+    }
+    return $inputDir.Trim('"')
+}
+
 function Get-InstallMarkerPath {
     param([string]$InstallRoot)
     return (Join-Path $InstallRoot $InstallMarkerName)
@@ -64,15 +98,76 @@ function Test-OwnedInstallRoot {
     }
 }
 
+function Test-LegacyInstallRoot {
+    param([string]$InstallRoot)
+    $projectDir = Join-Path $InstallRoot "video-subtitle-remover-main"
+    $pythonExe = Join-Path $InstallRoot "Python310\python.exe"
+    return (
+        (Test-Path -LiteralPath (Join-Path $projectDir "gui.py")) -or
+        (Test-Path -LiteralPath (Join-Path $projectDir "run_vsr.bat")) -or
+        (Test-Path -LiteralPath $pythonExe)
+    )
+}
+
 function Assert-OwnedInstallRoot {
     param([string]$InstallRoot)
-    if (!(Test-OwnedInstallRoot -InstallRoot $InstallRoot)) {
+    if (!(Test-OwnedInstallRoot -InstallRoot $InstallRoot) -and !(Test-LegacyInstallRoot -InstallRoot $InstallRoot)) {
         throw "Refusing to delete install directory because it is not marked as a VSR Online installation: $InstallRoot"
     }
 }
 
+function Stop-InstallRootProcesses {
+    param([string]$InstallRoot)
+    if (!(Test-Path -LiteralPath $InstallRoot)) {
+        return
+    }
+
+    $fullRoot = [System.IO.Path]::GetFullPath($InstallRoot).TrimEnd("\") + "\"
+    $ownProcessId = $PID
+    $processes = Get-CimInstance Win32_Process | Where-Object {
+        $_.ProcessId -ne $ownProcessId -and
+        $_.ExecutablePath -and
+        ([System.IO.Path]::GetFullPath($_.ExecutablePath).StartsWith($fullRoot, [System.StringComparison]::OrdinalIgnoreCase))
+    }
+
+    if (!$processes) {
+        return
+    }
+
+    Write-Step "Stopping VSR processes"
+    foreach ($process in $processes) {
+        Write-Host "Stopping PID $($process.ProcessId): $($process.Name)"
+        try {
+            Stop-Process -Id $process.ProcessId -Force -ErrorAction Stop
+        } catch {
+            Write-Host "Unable to stop PID $($process.ProcessId): $($_.Exception.Message)"
+        }
+    }
+    Start-Sleep -Seconds 2
+}
+
+function Remove-ItemWithRetry {
+    param(
+        [string]$Path,
+        [int]$RetryCount = 5
+    )
+    for ($attempt = 1; $attempt -le $RetryCount; $attempt++) {
+        try {
+            Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction Stop
+            return
+        } catch {
+            if ($attempt -ge $RetryCount) {
+                throw "Failed to remove $Path. Close any running VSR, Python, terminal, or Explorer windows using this directory, then run uninstall again. Original error: $($_.Exception.Message)"
+            }
+            Write-Host "Remove failed, retrying ($attempt/$RetryCount): $($_.Exception.Message)"
+            Start-Sleep -Seconds 2
+            Stop-InstallRootProcesses -InstallRoot $Path
+        }
+    }
+}
+
 if ([string]::IsNullOrWhiteSpace($InstallDir)) {
-    $InstallDir = Join-Path $env:LOCALAPPDATA "Programs\VSR_Online"
+    $InstallDir = Read-UninstallDir -DefaultInstallDir (Resolve-DefaultInstallDir)
 }
 
 $installRoot = [System.IO.Path]::GetFullPath($InstallDir)
@@ -116,8 +211,9 @@ if ($KeepDownloads -and (Test-Path -LiteralPath $downloadDir)) {
 }
 
 if (Test-Path -LiteralPath $installRoot) {
+    Stop-InstallRootProcesses -InstallRoot $installRoot
     Write-Step "Removing install directory"
-    Remove-Item -LiteralPath $installRoot -Recurse -Force
+    Remove-ItemWithRetry -Path $installRoot
 } else {
     Write-Host "Install directory does not exist."
 }

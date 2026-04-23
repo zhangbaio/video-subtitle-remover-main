@@ -19,11 +19,13 @@ if not exist "%PS_SCRIPT%" (
 powershell -NoProfile -ExecutionPolicy Bypass -File "%PS_SCRIPT%" %*
 set "EXIT_CODE=%ERRORLEVEL%"
 
-if not "%EXIT_CODE%"=="0" (
-    echo.
+echo.
+if "%EXIT_CODE%"=="0" (
+    echo Install completed successfully.
+) else (
     echo Install failed. Exit code: %EXIT_CODE%
-    pause
 )
+pause
 
 exit /b %EXIT_CODE%
 
@@ -35,6 +37,8 @@ echo   install_vsr_online.bat
 echo   install_vsr_online.bat -Force
 echo   install_vsr_online.bat -Backend cu126
 echo   install_vsr_online.bat -InstallDir "D:\Apps\VSR_Online"
+echo.
+echo If -InstallDir is omitted, the PowerShell installer prompts for an install directory.
 echo.
 echo Backends:
 echo   auto, cpu, directml, cu118, cu126, cu128

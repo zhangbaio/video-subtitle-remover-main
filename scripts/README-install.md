@@ -9,9 +9,10 @@ This folder contains an online installer script for Windows users who do not hav
 Default install path:
 
 ```text
-%LOCALAPPDATA%\Programs\VSR_Online
+..\VSR_Online
 ```
 
+鏈彁渚?`-InstallDir` 鏃讹紝瀹夎鍣ㄤ細鎻愮ず杈撳叆瀹夎鐩綍銆?鐩存帴鍥炶溅浼氫娇鐢ㄤ笅杞芥簮鐮佺洰褰曟梺杈圭殑 `VSR_Online` 鏂囦欢澶广€?
 ## Backend Selection
 
 The default backend is `auto`.
