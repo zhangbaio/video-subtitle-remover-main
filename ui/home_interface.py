@@ -18,7 +18,7 @@ from backend.tools.constant import InpaintMode
 from backend.tools.subtitle_detect import auto_detect_subtitle_area
 from backend.tools.subtitle_remover_remote_call import SubtitleRemoverRemoteCall
 from backend.tools.process_manager import ProcessManager
-from backend.tools.common_tools import get_readable_path, is_image_file, read_image
+from backend.tools.common_tools import get_readable_path, is_image_file, is_video_or_image, read_image
 
 class HomeInterface(QWidget):
     progress_signal = Signal(int, bool)
@@ -142,6 +142,11 @@ class HomeInterface(QWidget):
         self.file_button.setIcon(FluentIcon.FOLDER)
         self.file_button.clicked.connect(self.open_file)
         button_layout.addWidget(self.file_button)
+
+        self.folder_button = PushButton("\u6253\u5f00\u6587\u4ef6\u5939", self)
+        self.folder_button.setIcon(FluentIcon.FOLDER)
+        self.folder_button.clicked.connect(self.open_folder)
+        button_layout.addWidget(self.folder_button)
 
         self.auto_area_button = PushButton("自动框选", self)
         self.auto_area_button.setIcon(FluentIcon.SEARCH)
@@ -726,6 +731,39 @@ class HomeInterface(QWidget):
                 self.task_list_component.add_task(path)
                 index = max(0, self.task_list_component.find_task_index_by_path(path))
                 self.task_list_component.select_task(index)
+
+    def open_folder(self):
+        folder = QtWidgets.QFileDialog.getExistingDirectory(
+            self,
+            "\u6253\u5f00\u6587\u4ef6\u5939",
+            ""
+        )
+        if not folder:
+            return
+
+        files = []
+        for name in os.listdir(folder):
+            path = os.path.join(folder, name)
+            if os.path.isfile(path) and is_video_or_image(path):
+                files.append(path)
+
+        files = sorted(files, key=lambda path: os.path.basename(path).lower())
+        if not files:
+            self.append_output(f"\u6587\u4ef6\u5939\u5185\u672a\u627e\u5230\u652f\u6301\u7684\u89c6\u9891\u6216\u56fe\u7247\u6587\u4ef6: {folder}")
+            return
+
+        files_loaded = []
+        for path in reversed(files):
+            if self.load_video(path):
+                self.append_output(f"{tr['SubtitleExtractorGUI']['OpenVideoSuccess']}: {path}")
+                files_loaded.append(path)
+            else:
+                self.append_output(f"{tr['SubtitleExtractorGUI']['OpenVideoFailed']}: {path}")
+
+        for path in reversed(files_loaded):
+            self.task_list_component.add_task(path)
+            index = max(0, self.task_list_component.find_task_index_by_path(path))
+            self.task_list_component.select_task(index)
 
     def closeEvent(self, event):
         """窗口关闭时断开信号连接并清理资源"""
