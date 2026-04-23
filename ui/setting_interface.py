@@ -47,6 +47,15 @@ class SettingInterface(QtWidgets.QVBoxLayout):
         )
         self.addWidget(self.subtitle_detect_model_combo)
 
+        self.auto_subtitle_area_selection = SwitchSettingCard(
+            configItem=config.autoSubtitleAreaSelection,
+            icon=FluentIcon.SEARCH,
+            title=tr["Setting"]["AutoSubtitleAreaSelection"],
+            content=tr["Setting"]["AutoSubtitleAreaSelectionDesc"],
+            parent=parent
+        )
+        self.addWidget(self.auto_subtitle_area_selection)
+
         # 是否启用硬件加速
         self.hardware_acceleration = SwitchSettingCard(
             configItem=config.hardwareAcceleration,

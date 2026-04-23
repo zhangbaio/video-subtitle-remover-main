@@ -384,6 +384,31 @@ class HomeInterface(QWidget):
         else:
             self.append_output(f"自动框选完成: {areas}, 置信度 {confidence:.2f}")
 
+    def ensure_subtitle_areas_before_run(self, task_index, video_path):
+        subtitle_areas = self.task_list_component.get_task_option(task_index, TaskOptions.SUB_AREAS, [])
+        if subtitle_areas and len(subtitle_areas) > 0:
+            return subtitle_areas
+
+        if config.autoSubtitleAreaSelection.value and not is_image_file(video_path):
+            try:
+                self.append_log_signal.emit(["\u8fd0\u884c\u524d\u5f00\u59cb\u81ea\u52a8\u6846\u9009\u5b57\u5e55\u533a\u57df..."])
+                detected_areas, confidence = auto_detect_subtitle_area(video_path)
+                preview_areas = self.video_display_component.video_coordinates_to_preview_coordinates(detected_areas)
+                if preview_areas:
+                    self.video_display_component.set_selection_rects(preview_areas)
+                    self.video_display_component.save_selections_to_config()
+                    self.task_list_component.update_task_option(task_index, TaskOptions.SUB_AREAS, preview_areas)
+                    self.append_log_signal.emit([f"\u8fd0\u884c\u524d\u81ea\u52a8\u6846\u9009\u5b8c\u6210: {detected_areas}, \u7f6e\u4fe1\u5ea6 {confidence:.2f}"])
+                    return preview_areas
+                self.append_log_signal.emit(["\u8fd0\u884c\u524d\u81ea\u52a8\u6846\u9009\u5931\u8d25: \u672a\u627e\u5230\u53ef\u7528\u5b57\u5e55\u533a\u57df"])
+            except Exception as e:
+                traceback.print_exc()
+                self.append_log_signal.emit([f"\u8fd0\u884c\u524d\u81ea\u52a8\u6846\u9009\u5931\u8d25: {e}"])
+
+        subtitle_areas = [(0, self.frame_height, 0, self.frame_width)]
+        self.task_list_component.update_task_option(task_index, TaskOptions.SUB_AREAS, subtitle_areas)
+        return subtitle_areas
+
     def run_button_clicked(self):
         if not self.task_list_component.get_pending_tasks():
             self.append_output(tr['SubtitleExtractorGUI']['OpenVideoFirst'])
@@ -414,10 +439,10 @@ class HomeInterface(QWidget):
                                 continue
 
                             # 获取字幕区域坐标，未选择则使用全屏
-                            subtitle_areas = self.task_list_component.get_task_option(self.current_processing_task_index, TaskOptions.SUB_AREAS, [])
-                            if not subtitle_areas or len(subtitle_areas) <= 0:
-                                subtitle_areas = [(0, self.frame_height, 0, self.frame_width)]
-                                self.task_list_component.update_task_option(self.current_processing_task_index, TaskOptions.SUB_AREAS, subtitle_areas)
+                            subtitle_areas = self.ensure_subtitle_areas_before_run(
+                                self.current_processing_task_index,
+                                task_item.path
+                            )
 
                             self.video_display_component.save_selections_to_config()
 

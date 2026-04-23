@@ -101,6 +101,7 @@ class Config(QConfig):
 
     # 是否使用硬件加速
     hardwareAcceleration = ConfigItem("Main", "HardwareAcceleration", HARDWARD_ACCELERATION_OPTION, BoolValidator())
+    autoSubtitleAreaSelection = ConfigItem("Main", "AutoSubtitleAreaSelection", False, BoolValidator())
     
     # 启动时检查应用更新
     checkUpdateOnStartup = ConfigItem("Main", "CheckUpdateOnStartup", True, BoolValidator())
