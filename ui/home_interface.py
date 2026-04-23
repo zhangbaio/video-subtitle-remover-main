@@ -56,6 +56,7 @@ class HomeInterface(QWidget):
         self.running_process = None
         self._saved_inpaint_mode = None  # 保存图片锁定前的 inpaint 模式
         self._video_cap_lock = threading.Lock()  # 保护 video_cap 的线程锁
+        self._selection_change_source = None
 
         # 当前正在处理的任务索引
         self.current_processing_task_index = -1
@@ -205,6 +206,8 @@ class HomeInterface(QWidget):
         if get_current_task_index == -1:
             return
         self.task_list_component.update_task_option(get_current_task_index, TaskOptions.SUB_AREAS, selections)
+        source = self._selection_change_source or "manual"
+        self.task_list_component.update_task_option(get_current_task_index, TaskOptions.SUB_AREAS_SOURCE, source)
 
     def on_task_selected(self, index, file_path):
         """处理任务被选中事件
@@ -219,7 +222,11 @@ class HomeInterface(QWidget):
         self.video_display_component.set_ab_sections(ab_sections)
         selections = self.task_list_component.get_task_option(index, TaskOptions.SUB_AREAS, [])
         if len(selections) <= 0:
-            self.video_display_component.load_selections_from_config()
+            self._selection_change_source = "default"
+            try:
+                self.video_display_component.load_selections_from_config()
+            finally:
+                self._selection_change_source = None
         else:
             self.video_display_component.set_selection_rects(selections)
     
@@ -378,6 +385,7 @@ class HomeInterface(QWidget):
         current_task_index = self.task_list_component.get_current_task_index()
         if current_task_index >= 0:
             self.task_list_component.update_task_option(current_task_index, TaskOptions.SUB_AREAS, preview_areas)
+            self.task_list_component.update_task_option(current_task_index, TaskOptions.SUB_AREAS_SOURCE, "auto")
 
         if confidence <= 0:
             self.append_output(f"未检测到稳定字幕，已使用默认底部区域: {areas}")
@@ -386,10 +394,16 @@ class HomeInterface(QWidget):
 
     def ensure_subtitle_areas_before_run(self, task_index, video_path):
         subtitle_areas = self.task_list_component.get_task_option(task_index, TaskOptions.SUB_AREAS, [])
-        if subtitle_areas and len(subtitle_areas) > 0:
+        subtitle_areas_source = self.task_list_component.get_task_option(task_index, TaskOptions.SUB_AREAS_SOURCE, "")
+        should_auto_detect = (
+            config.autoSubtitleAreaSelection.value
+            and not is_image_file(video_path)
+            and subtitle_areas_source in ("", "default", "fallback")
+        )
+        if subtitle_areas and len(subtitle_areas) > 0 and not should_auto_detect:
             return subtitle_areas
 
-        if config.autoSubtitleAreaSelection.value and not is_image_file(video_path):
+        if should_auto_detect:
             try:
                 self.append_log_signal.emit(["\u8fd0\u884c\u524d\u5f00\u59cb\u81ea\u52a8\u6846\u9009\u5b57\u5e55\u533a\u57df..."])
                 detected_areas, confidence = auto_detect_subtitle_area(video_path)
@@ -398,6 +412,7 @@ class HomeInterface(QWidget):
                     self.video_display_component.set_selection_rects(preview_areas)
                     self.video_display_component.save_selections_to_config()
                     self.task_list_component.update_task_option(task_index, TaskOptions.SUB_AREAS, preview_areas)
+                    self.task_list_component.update_task_option(task_index, TaskOptions.SUB_AREAS_SOURCE, "auto")
                     self.append_log_signal.emit([f"\u8fd0\u884c\u524d\u81ea\u52a8\u6846\u9009\u5b8c\u6210: {detected_areas}, \u7f6e\u4fe1\u5ea6 {confidence:.2f}"])
                     return preview_areas
                 self.append_log_signal.emit(["\u8fd0\u884c\u524d\u81ea\u52a8\u6846\u9009\u5931\u8d25: \u672a\u627e\u5230\u53ef\u7528\u5b57\u5e55\u533a\u57df"])
@@ -407,6 +422,7 @@ class HomeInterface(QWidget):
 
         subtitle_areas = [(0, self.frame_height, 0, self.frame_width)]
         self.task_list_component.update_task_option(task_index, TaskOptions.SUB_AREAS, subtitle_areas)
+        self.task_list_component.update_task_option(task_index, TaskOptions.SUB_AREAS_SOURCE, "fallback")
         return subtitle_areas
 
     def run_button_clicked(self):
@@ -460,6 +476,8 @@ class HomeInterface(QWidget):
                             self.task_status_signal.emit(self.current_processing_task_index, TaskStatus.PROCESSING)
                             options = {}
                             for key in task_item.options:
+                                if key == TaskOptions.SUB_AREAS_SOURCE.value:
+                                    continue
                                 value = task_item.options[key]
                                 if key == TaskOptions.SUB_AREAS.value:
                                     value = self.video_display_component.preview_coordinates_to_video_coordinates(value)

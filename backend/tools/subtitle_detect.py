@@ -404,20 +404,33 @@ def auto_detect_subtitle_area(video_path, sample_count=36, bottom_start_ratio=0.
     ymins = [box[2] for box in selected_boxes]
     ymaxs = [box[3] for box in selected_boxes]
 
-    x_margin = max(12, int(frame_width * 0.05))
-    y_margin = max(10, int(frame_height * 0.035))
-    xmin = int(_percentile(xmins, 10)) - x_margin
-    xmax = int(_percentile(xmaxs, 90)) + x_margin
-    ymin = int(_percentile(ymins, 10)) - y_margin
-    ymax = int(_percentile(ymaxs, 90)) + y_margin
+    text_heights = [box[3] - box[2] for box in selected_boxes]
+    median_text_height = max(1, int(np.median(text_heights)))
+    confidence = min(1.0, hit_frames / max(1, len(frame_indexes)) * 2.0)
 
-    min_width = int(frame_width * 0.72)
+    if confidence >= 0.55:
+        x_margin = max(6, int(median_text_height * 0.9), int(frame_width * 0.012))
+        y_margin = max(4, int(median_text_height * 0.35), int(frame_height * 0.006))
+        min_width_ratio = 0.36
+        min_height_ratio = 0.045
+    else:
+        x_margin = max(10, int(median_text_height * 1.25), int(frame_width * 0.02))
+        y_margin = max(6, int(median_text_height * 0.55), int(frame_height * 0.01))
+        min_width_ratio = 0.48
+        min_height_ratio = 0.065
+
+    xmin = int(_percentile(xmins, 8)) - x_margin
+    xmax = int(_percentile(xmaxs, 92)) + x_margin
+    ymin = int(_percentile(ymins, 12)) - y_margin
+    ymax = int(_percentile(ymaxs, 88)) + y_margin
+
+    min_width = max(int(frame_width * min_width_ratio), int(np.median([box[1] - box[0] for box in selected_boxes]) * 1.25))
     if xmax - xmin < min_width:
         center_x = (xmin + xmax) // 2
         xmin = center_x - min_width // 2
         xmax = center_x + min_width // 2
 
-    min_height = int(frame_height * 0.13)
+    min_height = max(int(frame_height * min_height_ratio), int(median_text_height * 1.8))
     if ymax - ymin < min_height:
         center_y = (ymin + ymax) // 2
         ymin = center_y - min_height // 2
@@ -428,5 +441,4 @@ def auto_detect_subtitle_area(video_path, sample_count=36, bottom_start_ratio=0.
     ymin = max(0, min(ymin, frame_height - 1))
     ymax = max(ymin + 1, min(ymax, frame_height))
 
-    confidence = min(1.0, hit_frames / max(1, len(frame_indexes)) * 2.0)
     return [(ymin, ymax, xmin, xmax)], confidence
