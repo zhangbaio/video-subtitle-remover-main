@@ -1,19 +1,19 @@
-#define MyAppName "VSR NVIDIA CUDA 12.6"
+#define MyAppName "VSR NVIDIA CUDA 11.8"
 #define MyAppVersion "1.4.0"
 #define MyAppPublisher "YaoFANGUK"
 #define MyAppExeName "VSR.exe"
-#define SourceDir "D:\code\video-subtitle-remover-main\vsr_out_cu126_clean\Release"
+#define SourceDir "D:\code\video-subtitle-remover-main\vsr_out_cu118\Release"
 
 [Setup]
-AppId={{E56F4D3F-4A93-46A4-9C7E-CU126VSR140ASCII}}
+AppId={{E56F4D3F-4A93-46A4-9C7E-CU118VSR140ASCII}}
 AppName={#MyAppName}
 AppVersion={#MyAppVersion}
 AppPublisher={#MyAppPublisher}
-DefaultDirName={localappdata}\Programs\VSR_NVIDIA_CUDA_12_6
+DefaultDirName={localappdata}\Programs\VSR_NVIDIA_CUDA_11_8
 DefaultGroupName={#MyAppName}
 DisableProgramGroupPage=yes
-OutputDir=D:\code\video-subtitle-remover-main\installer-dist-cu126-ascii
-OutputBaseFilename=VSR_v1.4.0_windows_x64_nvidia_cuda12.6_ASCII_Setup
+OutputDir=D:\code\video-subtitle-remover-main\installer-dist-cu118-ascii
+OutputBaseFilename=VSR_v1.4.0_windows_x64_nvidia_cuda11.8_ASCII_Setup
 SetupIconFile={#SourceDir}\resources\design\vsr.ico
 Compression=lzma2/ultra64
 SolidCompression=yes
