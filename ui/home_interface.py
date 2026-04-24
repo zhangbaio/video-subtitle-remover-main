@@ -78,18 +78,36 @@ class BatchFolderManagerDialog(QtWidgets.QDialog):
         layout.addLayout(bottom_layout)
 
     def add_folder(self):
-        folder = QtWidgets.QFileDialog.getExistingDirectory(
-            self,
+        folders = self.select_multiple_directories(
             "\u9009\u62e9\u6587\u4ef6\u5939",
             self.selected_folders[-1] if self.selected_folders else ""
         )
-        if not folder:
+        if not folders:
             return
-        folder = os.path.normpath(folder)
-        if folder in self.selected_folders:
-            return
-        self.selected_folders.append(folder)
-        self.folder_list.addItem(folder)
+        for folder in folders:
+            folder = os.path.normpath(folder)
+            if folder in self.selected_folders:
+                continue
+            self.selected_folders.append(folder)
+            self.folder_list.addItem(folder)
+
+    def select_multiple_directories(self, title, initial_dir=""):
+        dialog = QtWidgets.QFileDialog(self, title, initial_dir)
+        dialog.setFileMode(QtWidgets.QFileDialog.Directory)
+        dialog.setOption(QtWidgets.QFileDialog.DontUseNativeDialog, True)
+        dialog.setOption(QtWidgets.QFileDialog.ShowDirsOnly, True)
+        for view in dialog.findChildren(QtWidgets.QListView):
+            view.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
+        for view in dialog.findChildren(QtWidgets.QTreeView):
+            view.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
+        if dialog.exec() != QtWidgets.QDialog.Accepted:
+            return []
+        folders = []
+        for folder in dialog.selectedFiles():
+            folder = os.path.normpath(folder)
+            if folder not in folders:
+                folders.append(folder)
+        return folders
 
     def remove_selected_folders(self):
         selected_items = self.folder_list.selectedItems()
@@ -893,14 +911,22 @@ class HomeInterface(QWidget):
         return sorted(files, key=lambda path: os.path.basename(path).lower())
 
     def open_folders_batch(self):
+        output_root = config.saveDirectory.value or ""
+        if not output_root:
+            self.append_output("\u8bf7\u5148\u5728\u9ad8\u7ea7\u8bbe\u7f6e -> \u89c6\u9891\u4fdd\u5b58\u76ee\u5f55 \u4e2d\u9009\u62e9\u8f93\u51fa\u6839\u76ee\u5f55")
+            return
+
         dialog = BatchFolderManagerDialog(
             self,
-            default_output_root=config.saveDirectory.value or ""
+            default_output_root=output_root
         )
+        dialog.output_root = output_root
+        dialog.output_root_edit.setText(output_root)
+        dialog.output_root_edit.setEnabled(False)
+        dialog.choose_output_button.setEnabled(False)
         if dialog.exec() != QtWidgets.QDialog.Accepted:
             return
         folders = dialog.selected_folders
-        output_root = dialog.output_root
 
         folder_output_subdirs = self._build_folder_output_subdirs(folders)
         imported_folder_count = 0

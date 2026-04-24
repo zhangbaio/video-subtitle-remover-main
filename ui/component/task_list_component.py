@@ -49,15 +49,22 @@ class Task:
         save_directory = self.output_root or config.saveDirectory.value or os.path.dirname(self.path)
         if self.output_subdir:
             save_directory = os.path.join(save_directory, self.output_subdir)
-        if self.is_image:
-            output_path = os.path.abspath(os.path.join(save_directory, f'{Path(self.path).stem}_no_sub.png'))
-        else:
-            output_path = os.path.abspath(os.path.join(save_directory, f'{Path(self.path).stem}_no_sub.mp4'))
+        source_directory = os.path.dirname(self.path)
+        if os.path.abspath(save_directory) == os.path.abspath(source_directory):
+            save_directory = os.path.join(save_directory, "no_sub_output")
+        output_path = os.path.abspath(os.path.join(save_directory, os.path.basename(self.path)))
         return output_path
 
     @output_path.setter
     def output_path(self, value):
         self._output_path = value
+
+    @property
+    def display_name(self):
+        if self.source_folder:
+            folder_name = os.path.basename(os.path.normpath(self.source_folder)) or self.source_folder
+            return f"{folder_name} / {self.name}"
+        return self.name
 
     @cached_property
     def is_image(self):
@@ -147,7 +154,7 @@ class TaskListComponent(QWidget):
         row = len(self.tasks) - 1
         self.table.setRowCount(len(self.tasks))
         
-        item0 = QTableWidgetItem(file_name)
+        item0 = QTableWidgetItem(task.display_name)
         item1 = QTableWidgetItem("0%")
         item2 = QTableWidgetItem(TaskStatus.PENDING.value)
         
