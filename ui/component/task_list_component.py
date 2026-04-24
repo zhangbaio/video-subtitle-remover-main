@@ -34,6 +34,10 @@ class Task:
     progress: int
     status: TaskStatus
     options: dict
+    batch_id: str = ""
+    source_folder: str = ""
+    output_root: str = ""
+    output_subdir: str = ""
     # 用于储存只读的输出路径, 在任务完成后设置
     _output_path: str = None
 
@@ -42,7 +46,9 @@ class Task:
         """获取输出路径"""
         if self._output_path is not None:
             return self._output_path
-        save_directory = os.path.dirname(self.path) if not config.saveDirectory.value else config.saveDirectory.value
+        save_directory = self.output_root or config.saveDirectory.value or os.path.dirname(self.path)
+        if self.output_subdir:
+            save_directory = os.path.join(save_directory, self.output_subdir)
         if self.is_image:
             output_path = os.path.abspath(os.path.join(save_directory, f'{Path(self.path).stem}_no_sub.png'))
         else:
@@ -108,7 +114,7 @@ class TaskListComponent(QWidget):
         
         layout.addWidget(self.table)
         
-    def add_task(self, video_path):
+    def add_task(self, video_path, batch_id="", source_folder="", output_root="", output_subdir=""):
         """添加任务到列表
         
         Args:
@@ -130,6 +136,10 @@ class TaskListComponent(QWidget):
             progress=0,
             status=TaskStatus.PENDING,
             options={},
+            batch_id=batch_id,
+            source_folder=source_folder,
+            output_root=output_root,
+            output_subdir=output_subdir,
         )
         self.tasks.append(task)
         
@@ -212,6 +222,12 @@ class TaskListComponent(QWidget):
             list: 待处理任务列表，每项为 (索引, 任务) 元组
         """
         return [(i, task) for i, task in enumerate(self.tasks) if task.status == TaskStatus.PENDING]
+
+    def get_pending_tasks_by_batch(self, batch_id):
+        return [
+            (i, task) for i, task in enumerate(self.tasks)
+            if task.status == TaskStatus.PENDING and task.batch_id == batch_id
+        ]
     
     def get_all_tasks(self):
         """获取所有任务

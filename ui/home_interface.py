@@ -4,6 +4,7 @@ import threading
 import multiprocessing
 import time
 import traceback
+from collections import Counter
 from PySide6.QtWidgets import QWidget, QHBoxLayout, QVBoxLayout
 from PySide6.QtCore import Slot, QRect, Signal
 from PySide6 import QtWidgets
@@ -18,7 +19,110 @@ from backend.tools.constant import InpaintMode
 from backend.tools.subtitle_detect import auto_detect_subtitle_area
 from backend.tools.subtitle_remover_remote_call import SubtitleRemoverRemoteCall
 from backend.tools.process_manager import ProcessManager
-from backend.tools.common_tools import get_readable_path, is_image_file, is_video_or_image, read_image
+from backend.tools.common_tools import get_readable_path, is_image_file, is_video_file, read_image
+
+class BatchFolderManagerDialog(QtWidgets.QDialog):
+    def __init__(self, parent=None, default_output_root=""):
+        super().__init__(parent)
+        self.setWindowTitle("\u6279\u91cf\u6587\u4ef6\u5939\u7ba1\u7406")
+        self.resize(720, 480)
+        self.selected_folders = []
+        self.output_root = default_output_root
+
+        layout = QVBoxLayout(self)
+
+        folder_label = QtWidgets.QLabel("\u5df2\u9009\u6587\u4ef6\u5939")
+        layout.addWidget(folder_label)
+
+        self.folder_list = QtWidgets.QListWidget(self)
+        self.folder_list.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
+        layout.addWidget(self.folder_list, 1)
+
+        folder_button_layout = QHBoxLayout()
+        self.add_folder_button = PushButton("\u6dfb\u52a0\u6587\u4ef6\u5939", self)
+        self.add_folder_button.clicked.connect(self.add_folder)
+        folder_button_layout.addWidget(self.add_folder_button)
+
+        self.remove_folder_button = PushButton("\u5220\u9664\u9009\u4e2d", self)
+        self.remove_folder_button.clicked.connect(self.remove_selected_folders)
+        folder_button_layout.addWidget(self.remove_folder_button)
+
+        self.clear_folder_button = PushButton("\u6e05\u7a7a", self)
+        self.clear_folder_button.clicked.connect(self.clear_folders)
+        folder_button_layout.addWidget(self.clear_folder_button)
+        folder_button_layout.addStretch(1)
+        layout.addLayout(folder_button_layout)
+
+        output_label = QtWidgets.QLabel("\u8f93\u51fa\u6839\u76ee\u5f55")
+        layout.addWidget(output_label)
+
+        output_layout = QHBoxLayout()
+        self.output_root_edit = QtWidgets.QLineEdit(self)
+        self.output_root_edit.setReadOnly(True)
+        self.output_root_edit.setText(self.output_root)
+        output_layout.addWidget(self.output_root_edit, 1)
+
+        self.choose_output_button = PushButton("\u9009\u62e9\u8f93\u51fa\u6839\u76ee\u5f55", self)
+        self.choose_output_button.clicked.connect(self.choose_output_root)
+        output_layout.addWidget(self.choose_output_button)
+        layout.addLayout(output_layout)
+
+        bottom_layout = QHBoxLayout()
+        bottom_layout.addStretch(1)
+        self.cancel_button = PushButton("\u53d6\u6d88", self)
+        self.cancel_button.clicked.connect(self.reject)
+        bottom_layout.addWidget(self.cancel_button)
+        self.confirm_button = PushButton("\u5f00\u59cb\u5bfc\u5165", self)
+        self.confirm_button.clicked.connect(self.accept_if_valid)
+        bottom_layout.addWidget(self.confirm_button)
+        layout.addLayout(bottom_layout)
+
+    def add_folder(self):
+        folder = QtWidgets.QFileDialog.getExistingDirectory(
+            self,
+            "\u9009\u62e9\u6587\u4ef6\u5939",
+            self.selected_folders[-1] if self.selected_folders else ""
+        )
+        if not folder:
+            return
+        folder = os.path.normpath(folder)
+        if folder in self.selected_folders:
+            return
+        self.selected_folders.append(folder)
+        self.folder_list.addItem(folder)
+
+    def remove_selected_folders(self):
+        selected_items = self.folder_list.selectedItems()
+        if not selected_items:
+            return
+        selected_paths = {item.text() for item in selected_items}
+        self.selected_folders = [folder for folder in self.selected_folders if folder not in selected_paths]
+        for item in selected_items:
+            self.folder_list.takeItem(self.folder_list.row(item))
+
+    def clear_folders(self):
+        self.selected_folders = []
+        self.folder_list.clear()
+
+    def choose_output_root(self):
+        folder = QtWidgets.QFileDialog.getExistingDirectory(
+            self,
+            "\u9009\u62e9\u8f93\u51fa\u6839\u76ee\u5f55",
+            self.output_root or (self.selected_folders[0] if self.selected_folders else "")
+        )
+        if not folder:
+            return
+        self.output_root = os.path.normpath(folder)
+        self.output_root_edit.setText(self.output_root)
+
+    def accept_if_valid(self):
+        if not self.selected_folders:
+            QtWidgets.QMessageBox.warning(self, "\u63d0\u793a", "\u8bf7\u5148\u6dfb\u52a0\u81f3\u5c11\u4e00\u4e2a\u6587\u4ef6\u5939")
+            return
+        if not self.output_root:
+            QtWidgets.QMessageBox.warning(self, "\u63d0\u793a", "\u8bf7\u9009\u62e9\u8f93\u51fa\u6839\u76ee\u5f55")
+            return
+        self.accept()
 
 class HomeInterface(QWidget):
     progress_signal = Signal(int, bool)
@@ -57,6 +161,7 @@ class HomeInterface(QWidget):
         self._saved_inpaint_mode = None  # 保存图片锁定前的 inpaint 模式
         self._video_cap_lock = threading.Lock()  # 保护 video_cap 的线程锁
         self._selection_change_source = None
+        self.current_processing_batch_id = None
 
         # 当前正在处理的任务索引
         self.current_processing_task_index = -1
@@ -148,6 +253,11 @@ class HomeInterface(QWidget):
         self.folder_button.setIcon(FluentIcon.FOLDER)
         self.folder_button.clicked.connect(self.open_folder)
         button_layout.addWidget(self.folder_button)
+
+        self.batch_folder_button = PushButton("\u6279\u91cf\u6587\u4ef6\u5939", self)
+        self.batch_folder_button.setIcon(FluentIcon.FOLDER)
+        self.batch_folder_button.clicked.connect(self.open_folders_batch)
+        button_layout.addWidget(self.batch_folder_button)
 
         self.auto_area_button = PushButton("自动框选", self)
         self.auto_area_button.setIcon(FluentIcon.SEARCH)
@@ -326,6 +436,7 @@ class HomeInterface(QWidget):
             self.running_process = None
             self.run_button.setVisible(True)
             self.stop_button.setVisible(False)
+            self.current_processing_batch_id = None
 
     @Slot(bool)
     def _toggle_buttons(self, show_run):
@@ -446,7 +557,13 @@ class HomeInterface(QWidget):
                             pending_tasks = self.task_list_component.get_pending_tasks()
                             if not pending_tasks:
                                 break
-                            pending_task = pending_tasks[0]
+                            current_batch_id = pending_tasks[0][1].batch_id
+                            batch_tasks = self.task_list_component.get_pending_tasks_by_batch(current_batch_id)
+                            pending_task = batch_tasks[0] if batch_tasks else pending_tasks[0]
+                            current_batch_task = pending_task[1]
+                            if current_batch_task.source_folder and self.current_processing_batch_id != current_batch_task.batch_id:
+                                self.current_processing_batch_id = current_batch_task.batch_id
+                                self.append_log_signal.emit([f"\u5904\u7406\u6587\u4ef6\u5939: {current_batch_task.source_folder}"])
                             # 更新当前处理的任务索引
                             self.current_processing_task_index, task_item = pending_task
                             if not self.load_video(task_item.path):
@@ -485,6 +602,7 @@ class HomeInterface(QWidget):
                             # 清理缓存, 使用动态路径
                             task_item.output_path = None
                             output_path = task_item.output_path
+                            os.makedirs(os.path.dirname(output_path), exist_ok=True)
                             process = self.run_subtitle_remover_process(task_item.path, output_path, options)
 
                             # 检查是否在处理过程中被停止
@@ -597,6 +715,7 @@ class HomeInterface(QWidget):
         self.run_button.setVisible(True)
         self.stop_button.setVisible(False)
         self.se = None
+        self.current_processing_batch_id = None
         # 重置视频滑块
         self.video_slider.setValue(1)
         # 重置当前处理任务索引
@@ -752,6 +871,75 @@ class HomeInterface(QWidget):
         return True
 
 
+    def _build_folder_output_subdirs(self, folders):
+        counter = Counter()
+        subdirs = {}
+        for folder in folders:
+            folder_name = os.path.basename(os.path.normpath(folder)) or "output"
+            counter[folder_name] += 1
+            subdirs[folder] = folder_name if counter[folder_name] == 1 else f"{folder_name}_{counter[folder_name]}"
+        return subdirs
+
+    def _collect_supported_files(self, folder):
+        files = []
+        for name in os.listdir(folder):
+            path = os.path.join(folder, name)
+            if not os.path.isfile(path) or not is_video_file(path):
+                continue
+            stem = os.path.splitext(os.path.basename(path))[0].lower()
+            if stem.endswith("_no_sub"):
+                continue
+            files.append(path)
+        return sorted(files, key=lambda path: os.path.basename(path).lower())
+
+    def open_folders_batch(self):
+        dialog = BatchFolderManagerDialog(
+            self,
+            default_output_root=config.saveDirectory.value or ""
+        )
+        if dialog.exec() != QtWidgets.QDialog.Accepted:
+            return
+        folders = dialog.selected_folders
+        output_root = dialog.output_root
+
+        folder_output_subdirs = self._build_folder_output_subdirs(folders)
+        imported_folder_count = 0
+        imported_file_count = 0
+        first_task_index = -1
+
+        for folder in folders:
+            files = self._collect_supported_files(folder)
+            if not files:
+                self.append_output(f"\u6587\u4ef6\u5939\u5185\u672a\u627e\u5230\u652f\u6301\u7684\u89c6\u9891\u6587\u4ef6: {folder}")
+                continue
+
+            imported_folder_count += 1
+            batch_id = folder
+            output_subdir = folder_output_subdirs[folder]
+
+            for path in files:
+                if self.load_video(path):
+                    self.append_output(f"{tr['SubtitleExtractorGUI']['OpenVideoSuccess']}: {path}")
+                    self.task_list_component.add_task(
+                        path,
+                        batch_id=batch_id,
+                        source_folder=folder,
+                        output_root=output_root,
+                        output_subdir=output_subdir,
+                    )
+                    index = max(0, self.task_list_component.find_task_index_by_path(path))
+                    if first_task_index == -1:
+                        first_task_index = index
+                    imported_file_count += 1
+                else:
+                    self.append_output(f"{tr['SubtitleExtractorGUI']['OpenVideoFailed']}: {path}")
+
+        if first_task_index >= 0:
+            self.task_list_component.select_task(first_task_index)
+            self.append_output(
+                f"\u6279\u91cf\u5bfc\u5165\u5b8c\u6210: {imported_folder_count} \u4e2a\u6587\u4ef6\u5939, {imported_file_count} \u4e2a\u89c6\u9891/\u56fe\u7247, \u8f93\u51fa\u6839\u76ee\u5f55 {output_root}"
+            )
+
     def open_file(self):
         files, _ = QtWidgets.QFileDialog.getOpenFileNames(
             self,
@@ -771,7 +959,7 @@ class HomeInterface(QWidget):
             # 正序添加, 确保任务列表顺序一致
             for path in reversed(files_loaded):
                 # 添加到任务列表
-                self.task_list_component.add_task(path)
+                self.task_list_component.add_task(path, batch_id=path)
                 index = max(0, self.task_list_component.find_task_index_by_path(path))
                 self.task_list_component.select_task(index)
 
@@ -784,15 +972,9 @@ class HomeInterface(QWidget):
         if not folder:
             return
 
-        files = []
-        for name in os.listdir(folder):
-            path = os.path.join(folder, name)
-            if os.path.isfile(path) and is_video_or_image(path):
-                files.append(path)
-
-        files = sorted(files, key=lambda path: os.path.basename(path).lower())
+        files = self._collect_supported_files(folder)
         if not files:
-            self.append_output(f"\u6587\u4ef6\u5939\u5185\u672a\u627e\u5230\u652f\u6301\u7684\u89c6\u9891\u6216\u56fe\u7247\u6587\u4ef6: {folder}")
+            self.append_output(f"\u6587\u4ef6\u5939\u5185\u672a\u627e\u5230\u652f\u6301\u7684\u89c6\u9891\u6587\u4ef6: {folder}")
             return
 
         files_loaded = []
@@ -804,7 +986,7 @@ class HomeInterface(QWidget):
                 self.append_output(f"{tr['SubtitleExtractorGUI']['OpenVideoFailed']}: {path}")
 
         for path in reversed(files_loaded):
-            self.task_list_component.add_task(path)
+            self.task_list_component.add_task(path, batch_id=folder, source_folder=folder)
             index = max(0, self.task_list_component.find_task_index_by_path(path))
             self.task_list_component.select_task(index)
 
