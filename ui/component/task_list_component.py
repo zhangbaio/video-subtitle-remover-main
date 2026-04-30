@@ -38,6 +38,7 @@ class Task:
     source_folder: str = ""
     output_root: str = ""
     output_subdir: str = ""
+    elapsed_seconds: float = 0.0
     # 用于储存只读的输出路径, 在任务完成后设置
     _output_path: str = None
 
@@ -65,6 +66,14 @@ class Task:
             folder_name = os.path.basename(os.path.normpath(self.source_folder)) or self.source_folder
             return f"{folder_name} / {self.name}"
         return self.name
+
+    @property
+    def elapsed_display(self):
+        if self.elapsed_seconds <= 0:
+            return ""
+        if self.elapsed_seconds >= 60:
+            return f"{self.elapsed_seconds / 60:.1f}分钟"
+        return f"{int(round(self.elapsed_seconds))}秒"
 
     @cached_property
     def is_image(self):
@@ -97,8 +106,8 @@ class TaskListComponent(QWidget):
         
         # 创建表格
         self.table = TableWidget(self)
-        self.table.setColumnCount(3)
-        self.table.setHorizontalHeaderLabels([tr['TaskList']['Name'], tr['TaskList']['Progress'], tr['TaskList']['Status']])
+        self.table.setColumnCount(4)
+        self.table.setHorizontalHeaderLabels([tr['TaskList']['Name'], tr['TaskList']['Progress'], tr['TaskList']['Status'], "耗时"])
         
         # 设置表格样式
         self.table.setShowGrid(False)
@@ -110,6 +119,7 @@ class TaskListComponent(QWidget):
         header.setSectionResizeMode(1, QHeaderView.ResizeToContents)  # 进度列自适应内容宽度
         header.setSectionResizeMode(2, QHeaderView.ResizeToContents)  # 状态列自适应内容宽度
         
+        header.setSectionResizeMode(3, QHeaderView.ResizeToContents)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.SingleSelection)
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
@@ -157,6 +167,7 @@ class TaskListComponent(QWidget):
         item0 = QTableWidgetItem(task.display_name)
         item1 = QTableWidgetItem("0%")
         item2 = QTableWidgetItem(TaskStatus.PENDING.value)
+        item3 = QTableWidgetItem(task.elapsed_display)
         
         # 设置文件名单元格的省略模式为中间省略
         item0.setTextAlignment(Qt.AlignVCenter | Qt.AlignLeft)
@@ -166,10 +177,12 @@ class TaskListComponent(QWidget):
         
         item1.setTextAlignment(Qt.AlignCenter)
         item2.setTextAlignment(Qt.AlignCenter)
+        item3.setTextAlignment(Qt.AlignCenter)
         
         self.table.setItem(row, 0, item0)
         self.table.setItem(row, 1, item1)
         self.table.setItem(row, 2, item2)
+        self.table.setItem(row, 3, item3)
         
         # 滚动到最新添加的行
         self.table.scrollToBottom()
@@ -222,6 +235,13 @@ class TaskListComponent(QWidget):
             # 选中当前行
             self.table.selectRow(index)
     
+    def update_task_elapsed(self, index, elapsed_seconds):
+        if 0 <= index < len(self.tasks):
+            self.tasks[index].elapsed_seconds = elapsed_seconds
+            elapsed_item = self.table.item(index, 3)
+            if elapsed_item:
+                elapsed_item.setText(self.tasks[index].elapsed_display)
+
     def get_pending_tasks(self):
         """获取所有待处理的任务
         
@@ -299,7 +319,8 @@ class TaskListComponent(QWidget):
             reset_task_status_action = QAction(tr['TaskList']['ResetTaskStatus'], self)
             reset_task_status_action.triggered.connect((lambda: (
                     self.update_task_status(index.row(), TaskStatus.PENDING), 
-                    self.update_task_progress(index.row(), 0)
+                    self.update_task_progress(index.row(), 0),
+                    self.update_task_elapsed(index.row(), 0)
                 )
             ))
             menu.addAction(reset_task_status_action)
