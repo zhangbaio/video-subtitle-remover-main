@@ -533,6 +533,16 @@ class HomeInterface(QWidget):
             return subtitle_areas
 
         if should_auto_detect:
+            # \u540c\u6587\u4ef6\u5939\u6279\u6b21\uff1a\u590d\u7528\u5df2\u68c0\u6d4b\u533a\u57df\uff0c\u907f\u514d\u6bcf\u4e2a\u89c6\u9891\u91cd\u590d\u68c0\u6d4b
+            task = self.task_list_component.get_task(task_index)
+            if task and task.batch_id:
+                cached_areas = self.task_list_component.get_batch_auto_detected_areas(task.batch_id)
+                if cached_areas:
+                    self.task_list_component.update_task_option(task_index, TaskOptions.SUB_AREAS, cached_areas)
+                    self.task_list_component.update_task_option(task_index, TaskOptions.SUB_AREAS_SOURCE, "auto")
+                    self.append_log_signal.emit([f"\u590d\u7528\u540c\u6587\u4ef6\u5939\u5b57\u5e55\u533a\u57df: {cached_areas}"])
+                    return cached_areas
+
             try:
                 self.append_log_signal.emit(["\u8fd0\u884c\u524d\u5f00\u59cb\u81ea\u52a8\u6846\u9009\u5b57\u5e55\u533a\u57df..."])
                 detected_areas, confidence = auto_detect_subtitle_area(video_path)

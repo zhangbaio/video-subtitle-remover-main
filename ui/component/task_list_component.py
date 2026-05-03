@@ -441,3 +441,14 @@ class TaskListComponent(QWidget):
         """
         if 0 <= index < len(self.tasks):
             return self.tasks[index].options.get(task_option.value, default)
+
+    def get_batch_auto_detected_areas(self, batch_id):
+        """返回同一文件夹批次中已自动框选的字幕区域，用于后续任务复用。"""
+        if not batch_id:
+            return None
+        for task in self.tasks:
+            if (task.batch_id == batch_id
+                    and task.options.get(TaskOptions.SUB_AREAS_SOURCE.value) == "auto"
+                    and task.options.get(TaskOptions.SUB_AREAS.value)):
+                return task.options.get(TaskOptions.SUB_AREAS.value)
+        return None
