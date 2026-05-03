@@ -180,6 +180,7 @@ class HomeInterface(QWidget):
         self._video_cap_lock = threading.Lock()  # 保护 video_cap 的线程锁
         self._selection_change_source = None
         self.current_processing_batch_id = None
+        self.current_processing_task_start_time = None
 
         # 当前正在处理的任务索引
         self.current_processing_task_index = -1
@@ -455,6 +456,7 @@ class HomeInterface(QWidget):
             self.run_button.setVisible(True)
             self.stop_button.setVisible(False)
             self.current_processing_batch_id = None
+            self.current_processing_task_start_time = None
 
     @Slot(bool)
     def _toggle_buttons(self, show_run):
@@ -594,9 +596,14 @@ class HomeInterface(QWidget):
                                 self.append_log_signal.emit([f"\u5904\u7406\u6587\u4ef6\u5939: {current_batch_task.source_folder}"])
                             # 更新当前处理的任务索引
                             self.current_processing_task_index, task_item = pending_task
+                            self.current_processing_task_start_time = time.time()
                             if not self.load_video(task_item.path):
                                 self.append_log_signal.emit([tr['SubtitleExtractorGUI']['OpenVideoFailed'].format(task_item.path)])
                                 self.task_status_signal.emit(self.current_processing_task_index, TaskStatus.FAILED)
+                                self.task_list_component.update_task_elapsed(
+                                    self.current_processing_task_index,
+                                    max(0, time.time() - self.current_processing_task_start_time)
+                                )
                                 continue
 
                             # 获取字幕区域坐标，未选择则使用全屏
@@ -640,11 +647,19 @@ class HomeInterface(QWidget):
                             # 更新任务状态为已完成
                             task_obj = self.task_list_component.get_task(self.current_processing_task_index)
                             if process.exitcode == 0 and task_obj and task_obj.status == TaskStatus.PROCESSING:
+                                self.task_list_component.update_task_elapsed(
+                                    self.current_processing_task_index,
+                                    max(0, time.time() - self.current_processing_task_start_time)
+                                )
                                 self.progress_signal.emit(100, True)
                                 # 任务完成, 更新输出路径为只读
                                 task_obj.output_path = output_path
                                 self.task_status_signal.emit(self.current_processing_task_index, TaskStatus.COMPLETED)
                             else:
+                                self.task_list_component.update_task_elapsed(
+                                    self.current_processing_task_index,
+                                    max(0, time.time() - self.current_processing_task_start_time)
+                                )
                                 self.task_status_signal.emit(self.current_processing_task_index, TaskStatus.FAILED)
 
                         except Exception as e:
@@ -652,9 +667,14 @@ class HomeInterface(QWidget):
                             self.append_log_signal.emit([f"Error: {e}"])
                             # 更新任务状态为失败
                             if self.current_processing_task_index >= 0:
+                                self.task_list_component.update_task_elapsed(
+                                    self.current_processing_task_index,
+                                    max(0, time.time() - self.current_processing_task_start_time) if self.current_processing_task_start_time else 0
+                                )
                                 self.task_status_signal.emit(self.current_processing_task_index, TaskStatus.FAILED)
                             break
                         finally:
+                            self.current_processing_task_start_time = None
                             with self._video_cap_lock:
                                 if self.video_cap:
                                     self.video_cap.release()
@@ -1021,8 +1041,17 @@ class HomeInterface(QWidget):
             else:
                 self.append_output(f"{tr['SubtitleExtractorGUI']['OpenVideoFailed']}: {path}")
 
+        output_root = config.saveDirectory.value or ""
+        output_subdir = self._build_folder_output_subdirs([folder])[folder] if output_root else ""
+
         for path in reversed(files_loaded):
-            self.task_list_component.add_task(path, batch_id=folder, source_folder=folder)
+            self.task_list_component.add_task(
+                path,
+                batch_id=folder,
+                source_folder=folder,
+                output_root=output_root,
+                output_subdir=output_subdir,
+            )
             index = max(0, self.task_list_component.find_task_index_by_path(path))
             self.task_list_component.select_task(index)
 
