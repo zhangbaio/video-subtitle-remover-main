@@ -31,6 +31,18 @@ import time
 from tqdm import tqdm
 import numpy as np
 
+
+_LAMA_INPAINT_CACHE = {}
+_STTN_DET_INPAINT_CACHE = {}
+
+
+def _device_cache_key(device):
+    device_type = getattr(device, "type", None)
+    device_index = getattr(device, "index", None)
+    if device_type is not None:
+        return f"{device_type}:{device_index}"
+    return str(device)
+
 class SubtitleRemover:
     def __init__(self, vd_path, gui_mode=False):
         # 线程锁
@@ -463,11 +475,27 @@ class SubtitleRemover:
     def lama_inpaint(self):
         model_path = os.path.join(self.model_config.LAMA_MODEL_DIR, 'big-lama.pt')
         device = self.hardware_accelerator.device if self.hardware_accelerator.has_cuda() or self.hardware_accelerator.has_mps() else torch.device("cpu")
-        return LamaInpaint(device, model_path)
+        cache_key = (_device_cache_key(device), model_path)
+        model = _LAMA_INPAINT_CACHE.get(cache_key)
+        if model is None:
+            model = LamaInpaint(device, model_path)
+            _LAMA_INPAINT_CACHE[cache_key] = model
+        return model
 
     @cached_property
     def sttn_det_inpaint(self):
-        return STTNDetInpaint(self.hardware_accelerator.device, self.model_config.STTN_DET_MODEL_PATH)
+        device = self.hardware_accelerator.device
+        cache_key = (
+            _device_cache_key(device),
+            self.model_config.STTN_DET_MODEL_PATH,
+            config.sttnNeighborStride.value,
+            config.sttnReferenceLength.value,
+        )
+        model = _STTN_DET_INPAINT_CACHE.get(cache_key)
+        if model is None:
+            model = STTNDetInpaint(device, self.model_config.STTN_DET_MODEL_PATH)
+            _STTN_DET_INPAINT_CACHE[cache_key] = model
+        return model
 
 
 if __name__ == '__main__':

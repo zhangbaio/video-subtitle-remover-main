@@ -184,6 +184,10 @@ class HomeInterface(QWidget):
 
         # 当前正在处理的任务索引
         self.current_processing_task_index = -1
+        self.worker_process = None
+        self.worker_command_queue = None
+        self.worker_remote_caller = None
+        self.last_worker_job_succeeded = False
 
         self.__init_widgets()
         self.progress_signal.connect(self.update_progress)
@@ -447,7 +451,7 @@ class HomeInterface(QWidget):
             self._stop_event.set()
             running_process = self.running_process
             if running_process:
-                ProcessManager.instance().terminate_by_process(running_process)
+                self._dispose_subtitle_worker(terminate=True)
             # 更新任务状态为待处理
             if self.current_processing_task_index >= 0:
                 self.task_list_component.update_task_status(self.current_processing_task_index, TaskStatus.PENDING)
@@ -457,6 +461,66 @@ class HomeInterface(QWidget):
             self.stop_button.setVisible(False)
             self.current_processing_batch_id = None
             self.current_processing_task_start_time = None
+
+    def _register_worker_callbacks(self, remote_caller):
+        remote_caller.register_update_progress_callback(self.progress_signal.emit)
+        remote_caller.register_log_callback(self.append_log_signal.emit)
+        remote_caller.register_update_preview_with_comp_callback(self.update_preview_with_comp_signal.emit)
+        remote_caller.register_error_callback(self.task_error_signal.emit)
+
+    def _ensure_subtitle_worker(self):
+        if (
+            self.worker_process
+            and self.worker_process.is_alive()
+            and self.worker_command_queue is not None
+            and self.worker_remote_caller is not None
+        ):
+            self.running_process = self.worker_process
+            return self.worker_process
+
+        self._dispose_subtitle_worker(terminate=False)
+        remote_caller = SubtitleRemoverRemoteCall()
+        self._register_worker_callbacks(remote_caller)
+        command_queue = multiprocessing.Queue()
+        process = multiprocessing.Process(
+            target=HomeInterface.remover_worker_process,
+            args=(command_queue, remote_caller.queue)
+        )
+        process.start()
+        ProcessManager.instance().add_process(process)
+        self.worker_process = process
+        self.worker_command_queue = command_queue
+        self.worker_remote_caller = remote_caller
+        self.running_process = process
+        return process
+
+    def _dispose_subtitle_worker(self, terminate=False):
+        process = self.worker_process
+        command_queue = self.worker_command_queue
+        remote_caller = self.worker_remote_caller
+        self.worker_process = None
+        self.worker_command_queue = None
+        self.worker_remote_caller = None
+
+        if process:
+            if terminate:
+                ProcessManager.instance().terminate_by_process(process)
+            else:
+                if process.is_alive() and command_queue is not None:
+                    try:
+                        command_queue.put(("shutdown",))
+                    except Exception:
+                        pass
+                if process.is_alive():
+                    process.join(timeout=3)
+                if process.is_alive():
+                    ProcessManager.instance().terminate_by_process(process)
+
+        if remote_caller:
+            remote_caller.stop()
+
+        self.running_process = None
+        self.last_worker_job_succeeded = False
 
     @Slot(bool)
     def _toggle_buttons(self, show_run):
@@ -582,6 +646,8 @@ class HomeInterface(QWidget):
             # 开启后台线程处理视频
             def task():
                 try:
+                    self.append_log_signal.emit(["初始化处理引擎..."])
+                    self._ensure_subtitle_worker()
                     while not self._stop_event.is_set():
                         try:
                             pending_tasks = self.task_list_component.get_pending_tasks()
@@ -646,7 +712,7 @@ class HomeInterface(QWidget):
 
                             # 更新任务状态为已完成
                             task_obj = self.task_list_component.get_task(self.current_processing_task_index)
-                            if process.exitcode == 0 and task_obj and task_obj.status == TaskStatus.PROCESSING:
+                            if self.last_worker_job_succeeded and task_obj and task_obj.status == TaskStatus.PROCESSING:
                                 self.task_list_component.update_task_elapsed(
                                     self.current_processing_task_index,
                                     max(0, time.time() - self.current_processing_task_start_time)
@@ -679,7 +745,6 @@ class HomeInterface(QWidget):
                                 if self.video_cap:
                                     self.video_cap.release()
                                     self.video_cap = None
-                            time.sleep(1)
                 finally:
                     self.toggle_buttons_signal.emit(True)
 
@@ -719,10 +784,24 @@ class HomeInterface(QWidget):
             if sr:
                 sr.isFinished = True
                 sr.vsf_running = False
-            SubtitleRemoverRemoteCall.remote_call_finish(queue)
+            SubtitleRemoverRemoteCall.remote_call_finish_job(queue)
             
 
     # 修改run_subtitle_remover_process方法
+    @staticmethod
+    def remover_worker_process(command_queue, queue):
+        while True:
+            command = command_queue.get()
+            if not command:
+                continue
+            action = command[0]
+            if action == "shutdown":
+                break
+            if action != "run" or len(command) != 4:
+                continue
+            _, video_path, output_path, options = command
+            HomeInterface.remover_process(queue, video_path, output_path, options)
+
     def run_subtitle_remover_process(self, video_path, output_path, options):
         """
         使用多进程执行字幕提取，并等待进程完成
@@ -732,25 +811,27 @@ class HomeInterface(QWidget):
             output_path: 输出文件路径
             options: 任务选项
         """
-        subtitle_remover_remote_caller = SubtitleRemoverRemoteCall()
-        subtitle_remover_remote_caller.register_update_progress_callback(self.progress_signal.emit)
-        subtitle_remover_remote_caller.register_log_callback(self.append_log_signal.emit)
-        subtitle_remover_remote_caller.register_update_preview_with_comp_callback(self.update_preview_with_comp_signal.emit)
-        subtitle_remover_remote_caller.register_error_callback(self.task_error_signal.emit)
-        process = multiprocessing.Process(
-            target=HomeInterface.remover_process,
-            args=(subtitle_remover_remote_caller.queue, video_path, output_path, options)
-        )
-        try:
-            if self._stop_event.is_set():
-                return process
-            process.start()
-            ProcessManager.instance().add_process(process)
-            self.running_process = process
-            process.join()
-            print(f"Process exited with code {process.exitcode}")
-        finally:
-            subtitle_remover_remote_caller.stop()
+        process = self._ensure_subtitle_worker()
+        remote_caller = self.worker_remote_caller
+        self.last_worker_job_succeeded = False
+        if self._stop_event.is_set() or remote_caller is None or self.worker_command_queue is None:
+            return process
+
+        remote_caller.reset_job_state()
+        self.worker_command_queue.put(("run", video_path, output_path, options))
+        self.running_process = process
+
+        while not self._stop_event.is_set():
+            if remote_caller.wait_for_job_finish(timeout=0.2):
+                self.last_worker_job_succeeded = not remote_caller.job_had_error
+                break
+            if not process.is_alive():
+                break
+
+        if not process.is_alive():
+            print(f"Worker process exited with code {process.exitcode}")
+            if not self._stop_event.is_set():
+                self._dispose_subtitle_worker(terminate=False)
         return process
 
     @Slot()
@@ -1061,6 +1142,7 @@ class HomeInterface(QWidget):
             # 通知 worker 线程停止
             self._stop_event.set()
             # 终止子进程
+            self._dispose_subtitle_worker(terminate=False)
             ProcessManager.instance().terminate_all()
             # 等待 worker 线程结束（最多5秒）
             if self._worker_thread and self._worker_thread.is_alive():

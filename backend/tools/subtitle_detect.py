@@ -1,5 +1,4 @@
 import sys
-from functools import cached_property
 
 import cv2
 import numpy as np
@@ -13,6 +12,34 @@ from backend.config import config, tr
 from backend.scenedetect import scene_detect
 from backend.scenedetect.detectors import ContentDetector
 from backend.tools.inpaint_tools import is_frame_number_in_ab_sections
+
+
+_TEXT_DETECTOR_CACHE = {}
+
+
+def _get_text_detector():
+    import paddle
+    paddle.disable_signal_handler()
+    from paddleocr import TextDetection
+
+    hardware_accelerator = HardwareAccelerator.instance()
+    onnx_providers = tuple(hardware_accelerator.onnx_providers)
+    model_config = ModelConfig()
+    cache_key = (
+        model_config.DET_MODEL_NAME,
+        model_config.DET_MODEL_DIR,
+        onnx_providers,
+    )
+    detector = _TEXT_DETECTOR_CACHE.get(cache_key)
+    if detector is None:
+        detector = TextDetection(
+            model_name=model_config.DET_MODEL_NAME,
+            model_dir=model_config.DET_MODEL_DIR,
+            device="cpu",
+            enable_hpi=len(onnx_providers) > 0,
+        )
+        _TEXT_DETECTOR_CACHE[cache_key] = detector
+    return detector
 
 class SubtitleDetect:
     """
@@ -39,20 +66,9 @@ class SubtitleDetect:
         else:
             self.SAMPLE_STEP = 2
 
-    @cached_property
+    @property
     def text_detector(self):
-        import paddle
-        paddle.disable_signal_handler()
-        from paddleocr import TextDetection
-        hardware_accelerator = HardwareAccelerator.instance()
-        onnx_providers = hardware_accelerator.onnx_providers
-        model_config = ModelConfig()
-        return TextDetection(
-            model_name=model_config.DET_MODEL_NAME,
-            model_dir=model_config.DET_MODEL_DIR,
-            device="cpu",
-            enable_hpi=len(onnx_providers) > 0,
-        )
+        return _get_text_detector()
 
     def detect_subtitle(self, img):
         temp_list = []
