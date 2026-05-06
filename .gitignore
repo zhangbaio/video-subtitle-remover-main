@@ -381,3 +381,5 @@ inference.onnx
 # Local build artifacts
 .venv-build*/
 installer-dist*/
+vsr_out_cu126/
+vsr_out_cu128_clean/
