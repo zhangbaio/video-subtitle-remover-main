@@ -97,6 +97,8 @@ class SubtitleRemover:
         self.progress_listeners = []
         # inpaint的frame_no区域列表, 默认为inpaint所有帧
         self.ab_sections = None
+        self.preview_emit_interval = 0.2 if gui_mode else 0.0
+        self._last_preview_emit_time = 0.0
 
     @staticmethod
     def is_current_frame_no_start(frame_no, continuous_frame_no_list):
@@ -168,6 +170,14 @@ class SubtitleRemover:
         """
         pass
 
+    def push_preview_with_comp(self, frame_ori, frame_comp, force=False):
+        if not self.gui_mode:
+            return
+        now = time.monotonic()
+        if force or now - self._last_preview_emit_time >= self.preview_emit_interval:
+            self._last_preview_emit_time = now
+            self.update_preview_with_comp(frame_ori, frame_comp)
+
     def propainter_mode(self, tbar):
         sub_detector = SubtitleDetect(self.video_path, self.sub_areas)
         sub_list = sub_detector.find_subtitle_frame_no(sub_remover=self)
@@ -195,7 +205,7 @@ class SubtitleRemover:
                 self.video_writer.write(frame)
                 # self.append_output(f'write frame: {index}')
                 self.update_progress(tbar, increment=1)
-                self.update_preview_with_comp(frame, frame)
+                self.push_preview_with_comp(frame, frame)
                 continue
             # 如果有水印，判断该帧是不是开头帧
             else:
@@ -253,7 +263,7 @@ class SubtitleRemover:
                                         self.video_writer.write(inpainted_frame)
                                         # self.append_output(f'write frame: {start_frame_no + inner_index} with mask {sub_list[index]}')
                                         inner_index += 1
-                                        self.update_preview_with_comp(np.clip(batch[i]+mask[:,:,np.newaxis]*0.3,0,255).astype(np.uint8), inpainted_frame)
+                                        self.push_preview_with_comp(np.clip(batch[i]+mask[:,:,np.newaxis]*0.3,0,255).astype(np.uint8), inpainted_frame)
                                 self.update_progress(tbar, increment=len(batch))
 
     def sttn_auto_mode(self, tbar):
@@ -301,7 +311,7 @@ class SubtitleRemover:
                 self.video_writer.write(frame)
                 # self.append_output(f'write frame: {current_frame_index}')
                 self.update_progress(tbar, increment=1)
-                self.update_preview_with_comp(frame, frame)
+                self.push_preview_with_comp(frame, frame)
             # 如果是区间开始，则找到尾巴
             else:
                 start_frame_index = current_frame_index
@@ -340,7 +350,7 @@ class SubtitleRemover:
                             self.video_writer.write(inpainted_frame)
                             # self.append_output(f'write frame: {start_frame_index + inner_index} with mask')
                             inner_index += 1
-                            self.update_preview_with_comp(np.clip(batch[i]+mask[:,:,np.newaxis]*0.3,0,255).astype(np.uint8), inpainted_frame)
+                            self.push_preview_with_comp(np.clip(batch[i]+mask[:,:,np.newaxis]*0.3,0,255).astype(np.uint8), inpainted_frame)
                     self.update_progress(tbar, increment=len(batch))
         reader.stop()
 
@@ -374,10 +384,10 @@ class SubtitleRemover:
             if len(sub_list):
                 mask = create_mask(original_frame.shape[0:2], sub_list)
                 inpainted_frame = self.lama_inpaint.inpaint(original_frame, mask)
-                self.update_preview_with_comp(np.clip(original_frame+mask[:,:,np.newaxis]*0.3,0,255).astype(np.uint8), inpainted_frame)
+                self.push_preview_with_comp(np.clip(original_frame+mask[:,:,np.newaxis]*0.3,0,255).astype(np.uint8), inpainted_frame, force=True)
             else:
                 inpainted_frame = original_frame
-                self.update_preview_with_comp(original_frame, inpainted_frame)
+                self.push_preview_with_comp(original_frame, inpainted_frame, force=True)
             cv2.imencode(self.ext, inpainted_frame)[1].tofile(self.video_out_path)
             tbar.update(1)
             self.progress_total = 100

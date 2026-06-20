@@ -289,7 +289,7 @@ class STTNAutoInpaint:
                             if tbar is not None:
                                 input_sub_remover.update_progress(tbar, increment=1)
                             if original_frame is not None and input_sub_remover.gui_mode:
-                                input_sub_remover.update_preview_with_comp(original_frame, frame)
+                                input_sub_remover.push_preview_with_comp(original_frame, frame)
 
                 del frames_hr, frames, comps
                 gc.collect()

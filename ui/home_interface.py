@@ -4,6 +4,7 @@ import threading
 import multiprocessing
 import time
 import traceback
+from concurrent.futures import ThreadPoolExecutor
 from collections import Counter
 from PySide6.QtWidgets import QWidget, QHBoxLayout, QVBoxLayout
 from PySide6.QtCore import Slot, QRect, Signal
@@ -181,6 +182,12 @@ class HomeInterface(QWidget):
         self._selection_change_source = None
         self.current_processing_batch_id = None
         self.current_processing_task_start_time = None
+        self.current_processing_run_start_time = None
+        self.auto_area_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="auto-area")
+        self._auto_area_lock = threading.Lock()
+        self._auto_area_futures = {}
+        self._auto_area_results = {}
+        self._auto_area_errors = {}
 
         # 当前正在处理的任务索引
         self.current_processing_task_index = -1
@@ -461,6 +468,7 @@ class HomeInterface(QWidget):
             self.stop_button.setVisible(False)
             self.current_processing_batch_id = None
             self.current_processing_task_start_time = None
+            self.current_processing_run_start_time = None
 
     def _register_worker_callbacks(self, remote_caller):
         remote_caller.register_update_progress_callback(self.progress_signal.emit)
@@ -533,6 +541,69 @@ class HomeInterface(QWidget):
         self.auto_area_button.setEnabled(not running)
         self.auto_area_button.setText("识别中..." if running else "自动框选")
 
+    def _task_needs_auto_area(self, task_index, video_path):
+        subtitle_areas = self.task_list_component.get_task_option(task_index, TaskOptions.SUB_AREAS, [])
+        subtitle_areas_source = self.task_list_component.get_task_option(task_index, TaskOptions.SUB_AREAS_SOURCE, "")
+        return (
+            config.autoSubtitleAreaSelection.value
+            and not is_image_file(video_path)
+            and (not subtitle_areas or subtitle_areas_source in ("", "default", "fallback"))
+        )
+
+    def _schedule_auto_area_detection(self, task_index, video_path):
+        if not self._task_needs_auto_area(task_index, video_path):
+            return
+
+        with self._auto_area_lock:
+            if video_path in self._auto_area_results or video_path in self._auto_area_futures:
+                return
+            self._auto_area_errors.pop(video_path, None)
+            future = self.auto_area_executor.submit(auto_detect_subtitle_area, video_path)
+            self._auto_area_futures[video_path] = future
+
+        def _done_callback(done_future):
+            try:
+                result = done_future.result()
+            except Exception as e:
+                with self._auto_area_lock:
+                    self._auto_area_errors[video_path] = str(e)
+                    self._auto_area_futures.pop(video_path, None)
+                return
+
+            with self._auto_area_lock:
+                self._auto_area_results[video_path] = result
+                self._auto_area_futures.pop(video_path, None)
+                self._auto_area_errors.pop(video_path, None)
+
+        future.add_done_callback(_done_callback)
+
+    def _schedule_pending_auto_area_detections(self):
+        for task_index, task in self.task_list_component.get_pending_tasks():
+            self._schedule_auto_area_detection(task_index, task.path)
+
+    def _get_auto_area_detection_result(self, video_path):
+        with self._auto_area_lock:
+            result = self._auto_area_results.get(video_path)
+            future = self._auto_area_futures.get(video_path)
+            error = self._auto_area_errors.get(video_path)
+        return result, future, error
+
+    def _apply_detected_areas_to_task(self, task_index, detected_areas, confidence, source="auto", log_prefix=""):
+        preview_areas = self.video_display_component.video_coordinates_to_preview_coordinates(detected_areas)
+        if not preview_areas:
+            if log_prefix:
+                self.append_log_signal.emit([f"{log_prefix}自动框选失败: 无法转换字幕区域坐标"])
+            return None
+
+        self.video_display_component.set_selection_rects(preview_areas)
+        self.video_display_component.save_selections_to_config()
+        self.task_list_component.update_task_option(task_index, TaskOptions.SUB_AREAS, preview_areas)
+        self.task_list_component.update_task_option(task_index, TaskOptions.SUB_AREAS_SOURCE, source)
+
+        if log_prefix:
+            self.append_log_signal.emit([f"{log_prefix}自动框选完成: {detected_areas}, 置信度 {confidence:.2f}"])
+        return preview_areas
+
     def auto_area_button_clicked(self):
         if not self.video_path:
             self.append_output(tr['SubtitleExtractorGUI']['OpenVideoFirst'])
@@ -590,40 +661,42 @@ class HomeInterface(QWidget):
     def ensure_subtitle_areas_before_run(self, task_index, video_path):
         subtitle_areas = self.task_list_component.get_task_option(task_index, TaskOptions.SUB_AREAS, [])
         subtitle_areas_source = self.task_list_component.get_task_option(task_index, TaskOptions.SUB_AREAS_SOURCE, "")
-        should_auto_detect = (
-            config.autoSubtitleAreaSelection.value
-            and not is_image_file(video_path)
-            and subtitle_areas_source in ("", "default", "fallback")
-        )
+        should_auto_detect = self._task_needs_auto_area(task_index, video_path)
         if subtitle_areas and len(subtitle_areas) > 0 and not should_auto_detect:
             return subtitle_areas
 
         if should_auto_detect:
-            # \u540c\u6587\u4ef6\u5939\u6279\u6b21\uff1a\u590d\u7528\u5df2\u68c0\u6d4b\u533a\u57df\uff0c\u907f\u514d\u6bcf\u4e2a\u89c6\u9891\u91cd\u590d\u68c0\u6d4b
-            task = self.task_list_component.get_task(task_index)
-            if task and task.batch_id:
-                cached_areas = self.task_list_component.get_batch_auto_detected_areas(task.batch_id)
-                if cached_areas:
-                    self.task_list_component.update_task_option(task_index, TaskOptions.SUB_AREAS, cached_areas)
-                    self.task_list_component.update_task_option(task_index, TaskOptions.SUB_AREAS_SOURCE, "auto")
-                    self.append_log_signal.emit([f"\u590d\u7528\u540c\u6587\u4ef6\u5939\u5b57\u5e55\u533a\u57df: {cached_areas}"])
-                    return cached_areas
-
             try:
-                self.append_log_signal.emit(["\u8fd0\u884c\u524d\u5f00\u59cb\u81ea\u52a8\u6846\u9009\u5b57\u5e55\u533a\u57df..."])
-                detected_areas, confidence = auto_detect_subtitle_area(video_path)
-                preview_areas = self.video_display_component.video_coordinates_to_preview_coordinates(detected_areas)
+                result, future, error = self._get_auto_area_detection_result(video_path)
+                if result is None and future is None and error is None:
+                    self._schedule_auto_area_detection(task_index, video_path)
+                    result, future, error = self._get_auto_area_detection_result(video_path)
+
+                if result is None and future is not None:
+                    self.append_log_signal.emit([f"运行前等待自动框选结果: {os.path.basename(video_path)}"])
+                    detected_areas, confidence = future.result()
+                    with self._auto_area_lock:
+                        self._auto_area_results[video_path] = (detected_areas, confidence)
+                        self._auto_area_futures.pop(video_path, None)
+                        self._auto_area_errors.pop(video_path, None)
+                elif result is not None:
+                    detected_areas, confidence = result
+                else:
+                    raise RuntimeError(error or "自动框选失败")
+
+                preview_areas = self._apply_detected_areas_to_task(
+                    task_index,
+                    detected_areas,
+                    confidence,
+                    source="auto",
+                    log_prefix="运行前",
+                )
                 if preview_areas:
-                    self.video_display_component.set_selection_rects(preview_areas)
-                    self.video_display_component.save_selections_to_config()
-                    self.task_list_component.update_task_option(task_index, TaskOptions.SUB_AREAS, preview_areas)
-                    self.task_list_component.update_task_option(task_index, TaskOptions.SUB_AREAS_SOURCE, "auto")
-                    self.append_log_signal.emit([f"\u8fd0\u884c\u524d\u81ea\u52a8\u6846\u9009\u5b8c\u6210: {detected_areas}, \u7f6e\u4fe1\u5ea6 {confidence:.2f}"])
                     return preview_areas
-                self.append_log_signal.emit(["\u8fd0\u884c\u524d\u81ea\u52a8\u6846\u9009\u5931\u8d25: \u672a\u627e\u5230\u53ef\u7528\u5b57\u5e55\u533a\u57df"])
+                self.append_log_signal.emit(["运行前自动框选失败: 未找到可用字幕区域"])
             except Exception as e:
                 traceback.print_exc()
-                self.append_log_signal.emit([f"\u8fd0\u884c\u524d\u81ea\u52a8\u6846\u9009\u5931\u8d25: {e}"])
+                self.append_log_signal.emit([f"运行前自动框选失败: {e}"])
 
         subtitle_areas = [(0, self.frame_height, 0, self.frame_width)]
         self.task_list_component.update_task_option(task_index, TaskOptions.SUB_AREAS, subtitle_areas)
@@ -648,11 +721,13 @@ class HomeInterface(QWidget):
                 try:
                     self.append_log_signal.emit(["初始化处理引擎..."])
                     self._ensure_subtitle_worker()
+                    self._schedule_pending_auto_area_detections()
                     while not self._stop_event.is_set():
                         try:
                             pending_tasks = self.task_list_component.get_pending_tasks()
                             if not pending_tasks:
                                 break
+                            self._schedule_pending_auto_area_detections()
                             current_batch_id = pending_tasks[0][1].batch_id
                             batch_tasks = self.task_list_component.get_pending_tasks_by_batch(current_batch_id)
                             pending_task = batch_tasks[0] if batch_tasks else pending_tasks[0]
@@ -666,9 +741,13 @@ class HomeInterface(QWidget):
                             if not self.load_video(task_item.path):
                                 self.append_log_signal.emit([tr['SubtitleExtractorGUI']['OpenVideoFailed'].format(task_item.path)])
                                 self.task_status_signal.emit(self.current_processing_task_index, TaskStatus.FAILED)
-                                self.task_list_component.update_task_elapsed(
+                                self.task_list_component.update_task_total_elapsed(
                                     self.current_processing_task_index,
                                     max(0, time.time() - self.current_processing_task_start_time)
+                                )
+                                self.task_list_component.update_task_process_elapsed(
+                                    self.current_processing_task_index,
+                                    0
                                 )
                                 continue
 
@@ -704,6 +783,7 @@ class HomeInterface(QWidget):
                             task_item.output_path = None
                             output_path = task_item.output_path
                             os.makedirs(os.path.dirname(output_path), exist_ok=True)
+                            self.current_processing_run_start_time = time.time()
                             process = self.run_subtitle_remover_process(task_item.path, output_path, options)
 
                             # 检查是否在处理过程中被停止
@@ -713,18 +793,26 @@ class HomeInterface(QWidget):
                             # 更新任务状态为已完成
                             task_obj = self.task_list_component.get_task(self.current_processing_task_index)
                             if self.last_worker_job_succeeded and task_obj and task_obj.status == TaskStatus.PROCESSING:
-                                self.task_list_component.update_task_elapsed(
+                                self.task_list_component.update_task_total_elapsed(
                                     self.current_processing_task_index,
                                     max(0, time.time() - self.current_processing_task_start_time)
+                                )
+                                self.task_list_component.update_task_process_elapsed(
+                                    self.current_processing_task_index,
+                                    max(0, time.time() - self.current_processing_run_start_time) if self.current_processing_run_start_time else 0
                                 )
                                 self.progress_signal.emit(100, True)
                                 # 任务完成, 更新输出路径为只读
                                 task_obj.output_path = output_path
                                 self.task_status_signal.emit(self.current_processing_task_index, TaskStatus.COMPLETED)
                             else:
-                                self.task_list_component.update_task_elapsed(
+                                self.task_list_component.update_task_total_elapsed(
                                     self.current_processing_task_index,
                                     max(0, time.time() - self.current_processing_task_start_time)
+                                )
+                                self.task_list_component.update_task_process_elapsed(
+                                    self.current_processing_task_index,
+                                    max(0, time.time() - self.current_processing_run_start_time) if self.current_processing_run_start_time else 0
                                 )
                                 self.task_status_signal.emit(self.current_processing_task_index, TaskStatus.FAILED)
 
@@ -733,14 +821,19 @@ class HomeInterface(QWidget):
                             self.append_log_signal.emit([f"Error: {e}"])
                             # 更新任务状态为失败
                             if self.current_processing_task_index >= 0:
-                                self.task_list_component.update_task_elapsed(
+                                self.task_list_component.update_task_total_elapsed(
                                     self.current_processing_task_index,
                                     max(0, time.time() - self.current_processing_task_start_time) if self.current_processing_task_start_time else 0
+                                )
+                                self.task_list_component.update_task_process_elapsed(
+                                    self.current_processing_task_index,
+                                    max(0, time.time() - self.current_processing_run_start_time) if self.current_processing_run_start_time else 0
                                 )
                                 self.task_status_signal.emit(self.current_processing_task_index, TaskStatus.FAILED)
                             break
                         finally:
                             self.current_processing_task_start_time = None
+                            self.current_processing_run_start_time = None
                             with self._video_cap_lock:
                                 if self.video_cap:
                                     self.video_cap.release()
@@ -1057,14 +1150,17 @@ class HomeInterface(QWidget):
             for path in files:
                 if self.load_video(path):
                     self.append_output(f"{tr['SubtitleExtractorGUI']['OpenVideoSuccess']}: {path}")
-                    self.task_list_component.add_task(
+                    row = self.task_list_component.add_task(
                         path,
                         batch_id=batch_id,
                         source_folder=folder,
                         output_root=output_root,
                         output_subdir=output_subdir,
                     )
-                    index = max(0, self.task_list_component.find_task_index_by_path(path))
+                    index = row if isinstance(row, int) and row >= 0 else max(0, self.task_list_component.find_task_index_by_path(path))
+                    task = self.task_list_component.get_task(index)
+                    if task and task.status == TaskStatus.COMPLETED:
+                        self.append_output(f"检测到已处理完成，跳过重复执行: {path}")
                     if first_task_index == -1:
                         first_task_index = index
                     imported_file_count += 1
@@ -1096,8 +1192,11 @@ class HomeInterface(QWidget):
             # 正序添加, 确保任务列表顺序一致
             for path in reversed(files_loaded):
                 # 添加到任务列表
-                self.task_list_component.add_task(path, batch_id=path)
-                index = max(0, self.task_list_component.find_task_index_by_path(path))
+                row = self.task_list_component.add_task(path, batch_id=path)
+                index = row if isinstance(row, int) and row >= 0 else max(0, self.task_list_component.find_task_index_by_path(path))
+                task = self.task_list_component.get_task(index)
+                if task and task.status == TaskStatus.COMPLETED:
+                    self.append_output(f"检测到已处理完成，跳过重复执行: {path}")
                 self.task_list_component.select_task(index)
 
     def open_folder(self):
@@ -1126,14 +1225,17 @@ class HomeInterface(QWidget):
         output_subdir = self._build_folder_output_subdirs([folder])[folder] if output_root else ""
 
         for path in reversed(files_loaded):
-            self.task_list_component.add_task(
+            row = self.task_list_component.add_task(
                 path,
                 batch_id=folder,
                 source_folder=folder,
                 output_root=output_root,
                 output_subdir=output_subdir,
             )
-            index = max(0, self.task_list_component.find_task_index_by_path(path))
+            index = row if isinstance(row, int) and row >= 0 else max(0, self.task_list_component.find_task_index_by_path(path))
+            task = self.task_list_component.get_task(index)
+            if task and task.status == TaskStatus.COMPLETED:
+                self.append_output(f"检测到已处理完成，跳过重复执行: {path}")
             self.task_list_component.select_task(index)
 
     def closeEvent(self, event):
@@ -1157,6 +1259,7 @@ class HomeInterface(QWidget):
             self.video_display_component.video_slider.valueChanged.disconnect(self.slider_changed)
             self.video_display_component.ab_sections_changed.disconnect(self.ab_sections_changed)
             self.video_display_component.selections_changed.disconnect(self.selections_changed)
+            self.auto_area_executor.shutdown(wait=False, cancel_futures=False)
             # 释放视频资源
             with self._video_cap_lock:
                 if self.video_cap:

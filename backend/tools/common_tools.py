@@ -1,6 +1,7 @@
 import os
 import sys
 import ctypes
+import time
 
 import cv2
 import numpy as np
@@ -37,12 +38,45 @@ def is_video_or_image(filename):
     # 检查扩展名是否在定义的视频或图片文件后缀集合中
     return file_extension in video_extensions or file_extension in image_extensions
 
-def merge_big_file_if_not_exists(dir, file, man_filename = None):
-    if file not in os.listdir(dir):
+def merge_big_file_if_not_exists(dir, file, man_filename=None, lock_timeout=300):
+    target_path = os.path.join(dir, file)
+    if os.path.exists(target_path):
+        return
+
+    lock_path = f"{target_path}.merge.lock"
+    lock_fd = None
+    start_time = time.time()
+
+    while True:
+        if os.path.exists(target_path):
+            return
+        try:
+            lock_fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_RDWR)
+            break
+        except FileExistsError:
+            if os.path.exists(target_path):
+                return
+            if time.time() - start_time > lock_timeout:
+                raise TimeoutError(f"Timed out waiting to merge model file: {target_path}")
+            time.sleep(0.2)
+
+    try:
+        if os.path.exists(target_path):
+            return
         fs = Filesplit()
         if man_filename is not None:
             fs.man_filename = man_filename
         fs.merge(input_dir=dir)
+    finally:
+        if lock_fd is not None:
+            try:
+                os.close(lock_fd)
+            except OSError:
+                pass
+            try:
+                os.remove(lock_path)
+            except OSError:
+                pass
 
 def get_readable_path(path):
     if sys.platform != 'win32':
