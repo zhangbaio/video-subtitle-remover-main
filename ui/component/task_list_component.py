@@ -33,6 +33,8 @@ class TaskOptions(Enum):
     AB_SECTIONS = "ab_sections"
     SUB_AREAS = "sub_areas"
     SUB_AREAS_SOURCE = "sub_areas_source"
+    SUBTITLE_INTERVALS = "subtitle_intervals"
+    FIXED_WATERMARK_AREAS = "fixed_watermark_areas"
 
 
 def _format_elapsed(seconds):

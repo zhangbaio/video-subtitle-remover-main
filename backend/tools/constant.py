@@ -10,6 +10,7 @@ class InpaintMode(Enum):
     LAMA = "lama"
     PROPAINTER = "propainter"
     OPENCV = "opencv"
+    FIXED_WATERMARK = "fixed-watermark"
 
 @unique
 class SubtitleDetectMode(Enum):

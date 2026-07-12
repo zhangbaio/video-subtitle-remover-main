@@ -2,7 +2,7 @@
 #define MyAppVersion "1.4.0"
 #define MyAppPublisher "YaoFANGUK"
 #define MyAppExeName "VSR.exe"
-#define SourceDir "D:\code\video-subtitle-remover-main\vsr_out_cu118\Release"
+#define SourceDir "D:\code\video-subtitle-remover-main\vsr_out_cu118_clean\Release"
 
 [Setup]
 AppId={{E56F4D3F-4A93-46A4-9C7E-CU118VSR140ASCII}}

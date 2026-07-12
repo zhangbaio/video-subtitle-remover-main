@@ -1,4 +1,5 @@
 import sys
+import threading
 
 import cv2
 import numpy as np
@@ -11,10 +12,11 @@ from .ocr import get_coordinates
 from backend.config import config, tr
 from backend.scenedetect import scene_detect
 from backend.scenedetect.detectors import ContentDetector
-from backend.tools.inpaint_tools import is_frame_number_in_ab_sections
+from backend.tools.inpaint_tools import is_frame_number_in_ab_sections, expand_frame_ranges
 
 
 _TEXT_DETECTOR_CACHE = {}
+_TEXT_DETECTOR_LOCAL = threading.local()
 
 
 def _get_text_detector():
@@ -30,7 +32,12 @@ def _get_text_detector():
         model_config.DET_MODEL_DIR,
         onnx_providers,
     )
-    detector = _TEXT_DETECTOR_CACHE.get(cache_key)
+    thread_cache = getattr(_TEXT_DETECTOR_LOCAL, "cache", None)
+    if thread_cache is None:
+        thread_cache = {}
+        _TEXT_DETECTOR_LOCAL.cache = thread_cache
+
+    detector = thread_cache.get(cache_key)
     if detector is None:
         detector = TextDetection(
             model_name=model_config.DET_MODEL_NAME,
@@ -38,6 +45,7 @@ def _get_text_detector():
             device="cpu",
             enable_hpi=len(onnx_providers) > 0,
         )
+        thread_cache[cache_key] = detector
         _TEXT_DETECTOR_CACHE[cache_key] = detector
     return detector
 
@@ -98,11 +106,12 @@ class SubtitleDetect:
                             break
         return temp_list
 
-    def find_subtitle_frame_no(self, sub_remover=None):
+    def find_subtitle_frame_no(self, sub_remover=None, ab_sections=None):
         video_cap = cv2.VideoCapture(get_readable_path(self.video_path))
         frame_count = video_cap.get(cv2.CAP_PROP_FRAME_COUNT)
         tbar = tqdm(total=int(frame_count), unit='frame', position=0, file=sys.__stdout__, desc='Subtitle Finding')
         current_frame_no = 0
+        effective_ab_sections = sub_remover.ab_sections if sub_remover else ab_sections
         # 阶段1：采样检测，仅对每隔 sample_step 帧执行 OCR
         sampled_results = {}  # frame_no -> temp_list
         if sub_remover:
@@ -114,7 +123,7 @@ class SubtitleDetect:
                 break
             # 读取视频帧成功
             current_frame_no += 1
-            if not is_frame_number_in_ab_sections(current_frame_no - 1, sub_remover.ab_sections):
+            if not is_frame_number_in_ab_sections(current_frame_no - 1, effective_ab_sections):
                 tbar.update(1)
                 continue
             # 仅对采样帧执行 OCR 推理
@@ -308,6 +317,24 @@ class SubtitleDetect:
             else:
                 merged.append((start, end))
         return merged
+
+
+def detect_subtitle_intervals(video_path, sub_areas, ab_sections=None):
+    detector = SubtitleDetect(video_path, sub_areas)
+    subtitle_frame_no_box_dict = detector.find_subtitle_frame_no(ab_sections=ab_sections)
+    if len(subtitle_frame_no_box_dict) == 0:
+        return []
+    intervals = detector.find_continuous_ranges_with_same_mask(subtitle_frame_no_box_dict)
+    intervals = expand_frame_ranges(
+        intervals,
+        config.subtitleTimelineBackwardFrameCount.value,
+        config.subtitleTimelineForwardFrameCount.value,
+    )
+    intervals = detector.filter_and_merge_intervals(
+        intervals,
+        config.sttnReferenceLength.value,
+    )
+    return intervals
 
 
 def _percentile(values, q):

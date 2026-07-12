@@ -78,6 +78,11 @@ class SettingInterface(QtWidgets.QVBoxLayout):
         """启用或禁用 inpaint 模式下拉框"""
         self.inpaint_mode_combo.comboBox.setEnabled(enabled)
 
+    def set_subtitle_controls_enabled(self, enabled):
+        """Enable OCR-related controls only for modes that use subtitle detection."""
+        self.subtitle_detect_model_combo.setEnabled(enabled)
+        self.auto_subtitle_area_selection.setEnabled(enabled)
+
     def reset_setting(self):
         """重置所有设置为默认值"""
         # 这里需要实现重置逻辑

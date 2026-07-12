@@ -20,11 +20,16 @@ from backend.inpaint.sttn_det_inpaint import STTNDetInpaint
 from backend.inpaint.lama_inpaint import LamaInpaint
 from backend.inpaint.opencv_inpaint import OpenCVInpaint
 from backend.inpaint.propainter_inpaint import PropainterInpaint
-from backend.tools.inpaint_tools import create_mask, batch_generator, expand_frame_ranges
+from backend.tools.inpaint_tools import (
+    create_mask,
+    batch_generator,
+    expand_frame_ranges,
+    is_frame_number_in_ab_sections,
+)
 from backend.tools.model_config import ModelConfig
 from backend.tools.ffmpeg_cli import FFmpegCLI
 from backend.tools.subtitle_detect import SubtitleDetect
-from backend.tools.video_io import FramePrefetcher, FFmpegVideoWriter
+from backend.tools.video_io import FramePrefetcher, FFmpegVideoWriter, create_processing_capture
 import tempfile
 import multiprocessing
 import time
@@ -34,6 +39,7 @@ import numpy as np
 
 _LAMA_INPAINT_CACHE = {}
 _STTN_DET_INPAINT_CACHE = {}
+_PROPAINTER_INPAINT_CACHE = {}
 
 
 def _device_cache_key(device):
@@ -97,6 +103,7 @@ class SubtitleRemover:
         self.progress_listeners = []
         # inpaint的frame_no区域列表, 默认为inpaint所有帧
         self.ab_sections = None
+        self.subtitle_intervals = None
         self.preview_emit_interval = 0.2 if gui_mode else 0.0
         self._last_preview_emit_time = 0.0
 
@@ -119,6 +126,39 @@ class SubtitleRemover:
             if start_no <= frame_no <= end_no:
                 return end_no
         return -1
+
+    @staticmethod
+    def intersect_intervals(primary_intervals, secondary_intervals):
+        def normalize(section):
+            if isinstance(section, range):
+                return section.start, section.stop - 1
+            return section[0], section[1]
+        if not primary_intervals:
+            return secondary_intervals
+        if not secondary_intervals:
+            return primary_intervals
+        result = []
+        for section_a in primary_intervals:
+            start_a, end_a = normalize(section_a)
+            for section_b in secondary_intervals:
+                start_b, end_b = normalize(section_b)
+                start = max(start_a, start_b)
+                end = min(end_a, end_b)
+                if start <= end:
+                    result.append((start, end))
+        return result
+
+    @staticmethod
+    def count_interval_frames(intervals):
+        if not intervals:
+            return 0
+        total = 0
+        for section in intervals:
+            if isinstance(section, range):
+                total += max(0, section.stop - section.start)
+            else:
+                total += max(0, int(section[1]) - int(section[0]) + 1)
+        return total
 
     def update_progress(self, tbar, increment):
         tbar.update(increment)
@@ -189,12 +229,19 @@ class SubtitleRemover:
                                                                           scene_div_points)
         del sub_detector
         gc.collect()        
-        device = self.hardware_accelerator.device if self.hardware_accelerator.has_cuda() else torch.device("cpu")
-        propainter_inpaint = PropainterInpaint(device, self.model_config.PROPAINTER_MODEL_DIR, config.propainterMaxLoadNum.value)
+        propainter_inpaint = self.propainter_inpaint_model
         self.append_output(tr['Main']['ProcessingStartRemovingSubtitles'])
         index = 0
         # 使用帧预读取，I/O 与推理重叠
-        reader = FramePrefetcher(self.video_cap)
+        read_cap = create_processing_capture(
+            self.video_path,
+            self.frame_width,
+            self.frame_height,
+            fps=self.fps,
+            frame_count=self.frame_count,
+            fallback_cap=self.video_cap,
+        )
+        reader = FramePrefetcher(read_cap)
         while True:
             ret, frame = reader.read()
             if not ret:
@@ -265,6 +312,84 @@ class SubtitleRemover:
                                         inner_index += 1
                                         self.push_preview_with_comp(np.clip(batch[i]+mask[:,:,np.newaxis]*0.3,0,255).astype(np.uint8), inpainted_frame)
                                 self.update_progress(tbar, increment=len(batch))
+        reader.release()
+
+    def _create_fixed_watermark_mask(self):
+        """Create a full-frame mask directly from the user-selected regions."""
+        mask_area_coordinates = []
+        for sub_area in self.sub_areas:
+            ymin, ymax, xmin, xmax = sub_area
+            mask_area_coordinates.append((xmin, xmax, ymin, ymax))
+        return create_mask(self.mask_size, mask_area_coordinates)
+
+    def _inpaint_fixed_watermark_batch(self, frames, mask):
+        """Inpaint a contiguous frame batch while handling a one-frame tail."""
+        if len(frames) == 1:
+            return [self.lama_inpaint.inpaint(frames[0], mask)]
+        return self.propainter_inpaint_model(frames, mask)
+
+    def fixed_watermark_mode(self, tbar):
+        """Remove a fixed watermark from manually selected regions without OCR."""
+        mask = self._create_fixed_watermark_mask()
+        if not np.any(mask):
+            raise ValueError(tr['Main']['FixedWatermarkAreaRequired'])
+
+        self.append_output(tr['Main']['ProcessingStartRemovingFixedWatermark'])
+        max_batch_size = max(2, int(config.propainterMaxLoadNum.value))
+        overlap = min(10, max(0, max_batch_size // 5))
+        if max_batch_size - overlap < 2:
+            overlap = 0
+
+        read_cap = create_processing_capture(
+            self.video_path,
+            self.frame_width,
+            self.frame_height,
+            fps=self.fps,
+            frame_count=self.frame_count,
+            fallback_cap=self.video_cap,
+        )
+        reader = FramePrefetcher(read_cap)
+        pending_frames = []
+
+        def write_processed_batch(frames, keep_overlap=False):
+            if not frames:
+                return []
+            inpainted_frames = self._inpaint_fixed_watermark_batch(frames, mask)
+            keep_count = overlap if keep_overlap and len(frames) > overlap else 0
+            write_count = len(frames) - keep_count
+            for index in range(write_count):
+                inpainted_frame = inpainted_frames[index]
+                self.video_writer.write(inpainted_frame)
+                self.push_preview_with_comp(
+                    np.clip(frames[index] + mask[:, :, np.newaxis] * 0.3, 0, 255).astype(np.uint8),
+                    inpainted_frame,
+                )
+            self.update_progress(tbar, increment=write_count)
+            return frames[write_count:]
+
+        frame_no = 0
+        try:
+            while True:
+                ret, frame = reader.read()
+                if not ret:
+                    break
+
+                if is_frame_number_in_ab_sections(frame_no, self.ab_sections):
+                    pending_frames.append(frame)
+                    if len(pending_frames) >= max_batch_size:
+                        pending_frames = write_processed_batch(pending_frames, keep_overlap=True)
+                else:
+                    if pending_frames:
+                        pending_frames = write_processed_batch(pending_frames)
+                    self.video_writer.write(frame)
+                    self.update_progress(tbar, increment=1)
+                    self.push_preview_with_comp(frame, frame)
+                frame_no += 1
+
+            if pending_frames:
+                write_processed_batch(pending_frames)
+        finally:
+            reader.release()
 
     def sttn_auto_mode(self, tbar):
         """
@@ -277,7 +402,23 @@ class SubtitleRemover:
             mask_area_coordinates.append((xmin, xmax, ymin, ymax))
         mask = create_mask(self.mask_size, mask_area_coordinates)
         sttn_video_inpaint = STTNAutoInpaint(self.hardware_accelerator.device, self.model_config.STTN_AUTO_MODEL_PATH, self.video_path)
-        sttn_video_inpaint(input_mask=mask, input_sub_remover=self, tbar=tbar)
+        original_ab_sections = self.ab_sections
+        try:
+            if self.subtitle_intervals:
+                if original_ab_sections:
+                    self.ab_sections = self.intersect_intervals(original_ab_sections, self.subtitle_intervals)
+                else:
+                    self.ab_sections = self.subtitle_intervals
+                active_frame_count = self.count_interval_frames(self.ab_sections)
+                skipped_frame_count = max(0, self.frame_count - active_frame_count)
+                skipped_ratio = (skipped_frame_count / self.frame_count * 100) if self.frame_count else 0
+                self.append_output(f"Subtitle intervals: {self.ab_sections}")
+                self.append_output(
+                    f"Skip non-subtitle frames: {skipped_frame_count}/{self.frame_count} ({skipped_ratio:.1f}%)"
+                )
+            sttn_video_inpaint(input_mask=mask, input_sub_remover=self, tbar=tbar)
+        finally:
+            self.ab_sections = original_ab_sections
 
     def video_inpaint(self, tbar, model):
         sub_detector = SubtitleDetect(self.video_path, self.sub_areas)
@@ -299,7 +440,15 @@ class SubtitleRemover:
         current_frame_index = 0
         self.append_output(tr['Main']['ProcessingStartRemovingSubtitles'])
         # 使用帧预读取，I/O 与推理重叠
-        reader = FramePrefetcher(self.video_cap)
+        read_cap = create_processing_capture(
+            self.video_path,
+            self.frame_width,
+            self.frame_height,
+            fps=self.fps,
+            frame_count=self.frame_count,
+            fallback_cap=self.video_cap,
+        )
+        reader = FramePrefetcher(read_cap)
         while True:
             ret, frame = reader.read()
             # 如果读取到为，则结束
@@ -352,12 +501,14 @@ class SubtitleRemover:
                             inner_index += 1
                             self.push_preview_with_comp(np.clip(batch[i]+mask[:,:,np.newaxis]*0.3,0,255).astype(np.uint8), inpainted_frame)
                     self.update_progress(tbar, increment=len(batch))
-        reader.stop()
+        reader.release()
 
     def run(self):
         # 记录开始时间
         start_time = time.time()
         if len(self.sub_areas) == 0:
+            if config.inpaintMode.value == InpaintMode.FIXED_WATERMARK:
+                raise ValueError(tr['Main']['FixedWatermarkAreaRequired'])
             self.append_output(tr['Main']['FullScreenProcessingNote'])
             self.sub_areas.append((0, self.frame_height, 0, self.frame_width))
         self.append_output(tr['Main']['SubtitleArea'].format(self.sub_areas))
@@ -367,7 +518,7 @@ class SubtitleRemover:
             accelerator_name = self.hardware_accelerator.accelerator_name
             if accelerator_name == 'DirectML' and config.inpaintMode.value not in [InpaintMode.STTN_AUTO, InpaintMode.STTN_DET]:
                 self.append_output(tr['Main']['DirectMLWarning'])
-        os.makedirs(os.path.dirname(self.video_out_path), exist_ok=True)
+        os.makedirs(os.path.dirname(os.path.abspath(self.video_out_path)), exist_ok=True)
         # 重置进度条
         self.progress_total = 0
         tbar = tqdm(total=int(self.frame_count), unit='frame', position=0, file=sys.__stdout__,
@@ -377,17 +528,22 @@ class SubtitleRemover:
             if original_frame is None:
                 self.append_output(tr['Main']['ReadImageFailed'].format(self.video_path))
                 return
-            sub_detector = SubtitleDetect(self.video_path, self.sub_areas)
-            sub_list = sub_detector.detect_subtitle(original_frame)
-            del sub_detector
-            gc.collect()
-            if len(sub_list):
-                mask = create_mask(original_frame.shape[0:2], sub_list)
+            if config.inpaintMode.value == InpaintMode.FIXED_WATERMARK:
+                mask = self._create_fixed_watermark_mask()
                 inpainted_frame = self.lama_inpaint.inpaint(original_frame, mask)
                 self.push_preview_with_comp(np.clip(original_frame+mask[:,:,np.newaxis]*0.3,0,255).astype(np.uint8), inpainted_frame, force=True)
             else:
-                inpainted_frame = original_frame
-                self.push_preview_with_comp(original_frame, inpainted_frame, force=True)
+                sub_detector = SubtitleDetect(self.video_path, self.sub_areas)
+                sub_list = sub_detector.detect_subtitle(original_frame)
+                del sub_detector
+                gc.collect()
+                if len(sub_list):
+                    mask = create_mask(original_frame.shape[0:2], sub_list)
+                    inpainted_frame = self.lama_inpaint.inpaint(original_frame, mask)
+                    self.push_preview_with_comp(np.clip(original_frame+mask[:,:,np.newaxis]*0.3,0,255).astype(np.uint8), inpainted_frame, force=True)
+                else:
+                    inpainted_frame = original_frame
+                    self.push_preview_with_comp(original_frame, inpainted_frame, force=True)
             cv2.imencode(self.ext, inpainted_frame)[1].tofile(self.video_out_path)
             tbar.update(1)
             self.progress_total = 100
@@ -396,6 +552,8 @@ class SubtitleRemover:
             self.log_model()
             if config.inpaintMode.value == InpaintMode.PROPAINTER:
                 self.propainter_mode(tbar)
+            elif config.inpaintMode.value == InpaintMode.FIXED_WATERMARK:
+                self.fixed_watermark_mode(tbar)
             elif config.inpaintMode.value == InpaintMode.STTN_AUTO:
                 self.sttn_auto_mode(tbar)
             elif config.inpaintMode.value == InpaintMode.STTN_DET:
@@ -434,8 +592,9 @@ class SubtitleRemover:
         self.append_output(tr['Main']['SubtitleRemoverModel'].format(f"{model_friendly_name} ({model_device})"))
         providers = ", ".join(self.hardware_accelerator.onnx_providers)
         providers_str = f" ({providers})" if providers else ""
-        detect_mode_name = list(tr['SubtitleDetectMode'].values())[list(SubtitleDetectMode).index(config.subtitleDetectMode.value)]
-        self.append_output(tr['Main']['SubtitleDetectionModel'].format(f"{detect_mode_name}{providers_str}"))
+        if config.inpaintMode.value != InpaintMode.FIXED_WATERMARK:
+            detect_mode_name = list(tr['SubtitleDetectMode'].values())[list(SubtitleDetectMode).index(config.subtitleDetectMode.value)]
+            self.append_output(tr['Main']['SubtitleDetectionModel'].format(f"{detect_mode_name}{providers_str}"))
 
     def merge_audio_to_video(self):
         # 创建音频临时对象，windows下delete=True会有permission denied的报错
@@ -507,6 +666,24 @@ class SubtitleRemover:
             _STTN_DET_INPAINT_CACHE[cache_key] = model
         return model
 
+    @cached_property
+    def propainter_inpaint_model(self):
+        device = self.hardware_accelerator.device if self.hardware_accelerator.has_cuda() else torch.device("cpu")
+        cache_key = (
+            _device_cache_key(device),
+            self.model_config.PROPAINTER_MODEL_DIR,
+            config.propainterMaxLoadNum.value,
+        )
+        model = _PROPAINTER_INPAINT_CACHE.get(cache_key)
+        if model is None:
+            model = PropainterInpaint(
+                device,
+                self.model_config.PROPAINTER_MODEL_DIR,
+                config.propainterMaxLoadNum.value,
+            )
+            _PROPAINTER_INPAINT_CACHE[cache_key] = model
+        return model
+
 
 if __name__ == '__main__':
     multiprocessing.set_start_method("spawn")
@@ -518,10 +695,11 @@ if __name__ == '__main__':
     tr.read(TRANSLATION_FILE, encoding='utf-8')
     sr = SubtitleRemover(args.input)
     if not is_video_or_image(args.input):
-        sr.append_output(f'Error: {video_path} is not supported not corrupted.')
+        sr.append_output(f'Error: {args.input} is not supported or is corrupted.')
         exit(-1)
     sr.sub_areas = args.subtitle_area_coords
-    sr.video_out_path = args.output
+    if args.output is not None:
+        sr.video_out_path = args.output
     config.inpaintMode.value = args.inpaint_mode
     sr.run()
         

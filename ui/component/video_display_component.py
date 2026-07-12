@@ -732,10 +732,11 @@ class VideoDisplayComponent(QWidget):
         self.active_selection_index = len(rects) - 1
         self.update_preview_with_rect()
     
-    def load_selections_from_config(self):
+    def load_selections_from_config(self, config_item=None):
         """从配置中加载选择框的相对位置和大小"""
         # 从配置中读取选择框的相对位置和大小
-        areas_str = config.subtitleSelectionAreas.value
+        config_item = config_item or config.subtitleSelectionAreas
+        areas_str = config_item.value
         
         # 检查配置值是否有效
         if not areas_str:
@@ -829,14 +830,43 @@ class VideoDisplayComponent(QWidget):
             selection_rects.append((preview_ymin, preview_ymax, preview_xmin, preview_xmax))
         return selection_rects
 
+    def preview_coordinates_to_normalized_video_coordinates(self, preview_selection_rects):
+        """Convert preview selections to video-relative coordinates independent of UI borders."""
+        if not self.frame_width or not self.frame_height:
+            return []
+        normalized_rects = []
+        for ymin, ymax, xmin, xmax in self.preview_coordinates_to_video_coordinates(preview_selection_rects):
+            normalized_rects.append((
+                ymin / self.frame_height,
+                ymax / self.frame_height,
+                xmin / self.frame_width,
+                xmax / self.frame_width,
+            ))
+        return normalized_rects
+
+    def normalized_video_coordinates_to_preview_coordinates(self, normalized_selection_rects):
+        """Convert video-relative coordinates to selections for the current preview geometry."""
+        if not self.frame_width or not self.frame_height:
+            return []
+        video_rects = []
+        for ymin, ymax, xmin, xmax in normalized_selection_rects:
+            video_rects.append((
+                round(max(0, min(1, ymin)) * self.frame_height),
+                round(max(0, min(1, ymax)) * self.frame_height),
+                round(max(0, min(1, xmin)) * self.frame_width),
+                round(max(0, min(1, xmax)) * self.frame_width),
+            ))
+        return self.video_coordinates_to_preview_coordinates(video_rects)
+
     def set_dragger_enabled(self, enabled):
         """设置拖动器是否可用"""
         self.enable_mouse_events = enabled
         self.video_display.setMouseTracking(enabled)
         self.video_display.setCursor(Qt.ArrowCursor)
 
-    def save_selections_to_config(self):
+    def save_selections_to_config(self, config_item=None, restore_default=True):
         """保存所有选择框的相对位置和大小"""
+        config_item = config_item or config.subtitleSelectionAreas
         areas_str_parts = []
         
         for rect in self.selection_rects:
@@ -845,9 +875,9 @@ class VideoDisplayComponent(QWidget):
             areas_str_parts.append(f"{round(ymin,4)},{round(ymax,4)},{round(xmin,4)},{round(xmax,4)}")
         
         # 更新配置
-        config.subtitleSelectionAreas.value = ";".join(areas_str_parts)
-        if len(config.subtitleSelectionAreas.value) <= 0:
-            config.subtitleSelectionAreas.value = config.subtitleSelectionAreas.defaultValue
+        config_item.value = ";".join(areas_str_parts)
+        if restore_default and len(config_item.value) <= 0:
+            config_item.value = config_item.defaultValue
         qconfig.save()
     
     def get_selection_rects(self):

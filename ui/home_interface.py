@@ -1,5 +1,6 @@
 import os
 import cv2
+import math
 import threading
 import multiprocessing
 import time
@@ -10,14 +11,14 @@ from PySide6.QtWidgets import QWidget, QHBoxLayout, QVBoxLayout
 from PySide6.QtCore import Slot, QRect, Signal
 from PySide6 import QtWidgets
 from datetime import datetime
-from qfluentwidgets import (PushButton, CardWidget, TextEdit, FluentIcon)
+from qfluentwidgets import (PushButton, CardWidget, TextEdit, FluentIcon, qconfig)
 from ui.setting_interface import SettingInterface
 from ui.component.video_display_component import VideoDisplayComponent
 from ui.component.task_list_component import TaskListComponent, TaskStatus, TaskOptions
 from ui.icon.my_fluent_icon import MyFluentIcon
 from backend.config import config, tr
 from backend.tools.constant import InpaintMode
-from backend.tools.subtitle_detect import auto_detect_subtitle_area
+from backend.tools.subtitle_detect import auto_detect_subtitle_area, detect_subtitle_intervals
 from backend.tools.subtitle_remover_remote_call import SubtitleRemoverRemoteCall
 from backend.tools.process_manager import ProcessManager
 from backend.tools.common_tools import get_readable_path, is_image_file, is_video_file, read_image
@@ -180,6 +181,8 @@ class HomeInterface(QWidget):
         self._saved_inpaint_mode = None  # 保存图片锁定前的 inpaint 模式
         self._video_cap_lock = threading.Lock()  # 保护 video_cap 的线程锁
         self._selection_change_source = None
+        self._auto_area_button_running = False
+        self._is_processing = False
         self.current_processing_batch_id = None
         self.current_processing_task_start_time = None
         self.current_processing_run_start_time = None
@@ -188,6 +191,10 @@ class HomeInterface(QWidget):
         self._auto_area_futures = {}
         self._auto_area_results = {}
         self._auto_area_errors = {}
+        self._subtitle_interval_futures = {}
+        self._subtitle_interval_results = {}
+        self._subtitle_interval_errors = {}
+        self._video_dimension_cache = {}
 
         # 当前正在处理的任务索引
         self.current_processing_task_index = -1
@@ -207,6 +214,8 @@ class HomeInterface(QWidget):
         self.auto_subtitle_area_signal.connect(self.on_auto_subtitle_area_detected)
         self.auto_subtitle_area_error_signal.connect(lambda message: self.append_output(message))
         self.auto_subtitle_area_running_signal.connect(self.set_auto_area_button_running)
+        config.inpaintMode.valueChanged.connect(self.on_inpaint_mode_changed)
+        self.on_inpaint_mode_changed(config.inpaintMode.value)
 
     def __init_widgets(self):
         """创建主页面"""
@@ -336,18 +345,136 @@ class HomeInterface(QWidget):
             self.update_preview(frame)
 
     def ab_sections_changed(self, ab_sections):
+        if self._is_processing:
+            return
         get_current_task_index = self.task_list_component.get_current_task_index()
         if get_current_task_index == -1:
             return
         self.task_list_component.update_task_option(get_current_task_index, TaskOptions.AB_SECTIONS, ab_sections)
 
     def selections_changed(self, selections):
+        if self._is_processing:
+            return
         get_current_task_index = self.task_list_component.get_current_task_index()
         if get_current_task_index == -1:
             return
+        if config.inpaintMode.value == InpaintMode.FIXED_WATERMARK:
+            normalized_areas = self._sanitize_normalized_areas(
+                self.video_display_component.preview_coordinates_to_normalized_video_coordinates(
+                    selections
+                )
+            )
+            self.task_list_component.update_task_option(
+                get_current_task_index,
+                TaskOptions.FIXED_WATERMARK_AREAS,
+                normalized_areas,
+            )
+            if self._selection_change_source is None:
+                self._save_fixed_watermark_areas(normalized_areas)
+                self._propagate_fixed_watermark_areas(get_current_task_index, normalized_areas)
+            return
+
         self.task_list_component.update_task_option(get_current_task_index, TaskOptions.SUB_AREAS, selections)
         source = self._selection_change_source or "manual"
         self.task_list_component.update_task_option(get_current_task_index, TaskOptions.SUB_AREAS_SOURCE, source)
+        self.task_list_component.update_task_option(get_current_task_index, TaskOptions.SUBTITLE_INTERVALS, None)
+
+    @staticmethod
+    def _parse_fixed_watermark_areas(value):
+        areas = []
+        for area in (value or "").split(";"):
+            if not area:
+                continue
+            try:
+                ymin, ymax, xmin, xmax = map(float, area.split(","))
+            except (TypeError, ValueError):
+                continue
+            areas.append((ymin, ymax, xmin, xmax))
+        return HomeInterface._sanitize_normalized_areas(areas)
+
+    @staticmethod
+    def _sanitize_normalized_areas(areas):
+        sanitized = []
+        for area in areas or []:
+            try:
+                ymin, ymax, xmin, xmax = map(float, area)
+            except (TypeError, ValueError):
+                continue
+            if not all(math.isfinite(value) for value in (ymin, ymax, xmin, xmax)):
+                continue
+            ymin, ymax = sorted((max(0.0, min(1.0, ymin)), max(0.0, min(1.0, ymax))))
+            xmin, xmax = sorted((max(0.0, min(1.0, xmin)), max(0.0, min(1.0, xmax))))
+            if ymax <= ymin or xmax <= xmin:
+                continue
+            sanitized.append((ymin, ymax, xmin, xmax))
+        return sanitized
+
+    @staticmethod
+    def _save_fixed_watermark_areas(areas):
+        areas = HomeInterface._sanitize_normalized_areas(areas)
+        config.fixedWatermarkSelectionAreas.value = ";".join(
+            f"{ymin:.6f},{ymax:.6f},{xmin:.6f},{xmax:.6f}"
+            for ymin, ymax, xmin, xmax in areas
+        )
+        qconfig.save()
+
+    def _get_video_dimensions(self, path):
+        dimensions = self._video_dimension_cache.get(path)
+        if dimensions:
+            return dimensions
+        cap = cv2.VideoCapture(get_readable_path(path))
+        dimensions = (
+            int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
+            int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)),
+        )
+        cap.release()
+        if dimensions[0] > 0 and dimensions[1] > 0:
+            self._video_dimension_cache[path] = dimensions
+            return dimensions
+        return None
+
+    @staticmethod
+    def _normalized_areas_to_video_coordinates(normalized_areas, dimensions):
+        if not dimensions:
+            return []
+        width, height = dimensions
+        video_areas = []
+        for ymin, ymax, xmin, xmax in HomeInterface._sanitize_normalized_areas(normalized_areas):
+            video_area = (
+                round(ymin * height),
+                round(ymax * height),
+                round(xmin * width),
+                round(xmax * width),
+            )
+            if video_area[1] > video_area[0] and video_area[3] > video_area[2]:
+                video_areas.append(video_area)
+        return video_areas
+
+    def _propagate_fixed_watermark_areas(self, task_index, normalized_areas):
+        """Apply a manual watermark selection to pending videos in the same aspect-ratio batch."""
+        normalized_areas = self._sanitize_normalized_areas(normalized_areas)
+        task = self.task_list_component.get_task(task_index)
+        if task is None:
+            return
+        target_dimensions = self._get_video_dimensions(task.path)
+        target_ratio = (
+            target_dimensions[0] / target_dimensions[1]
+            if target_dimensions and target_dimensions[1]
+            else None
+        )
+        for pending_index, pending_task in self.task_list_component.get_pending_tasks_by_batch(task.batch_id):
+            if target_ratio and pending_task.path != task.path:
+                dimensions = self._get_video_dimensions(pending_task.path)
+                if not dimensions or not dimensions[1]:
+                    continue
+                ratio = dimensions[0] / dimensions[1]
+                if abs(ratio - target_ratio) / target_ratio > 0.01:
+                    continue
+            self.task_list_component.update_task_option(
+                pending_index,
+                TaskOptions.FIXED_WATERMARK_AREAS,
+                list(normalized_areas),
+            )
 
     def on_task_selected(self, index, file_path):
         """处理任务被选中事件
@@ -361,6 +488,36 @@ class HomeInterface(QWidget):
         ab_sections = self.task_list_component.get_task_option(index, TaskOptions.AB_SECTIONS, [])
         self.video_display_component.set_ab_sections(ab_sections)
         selections = self.task_list_component.get_task_option(index, TaskOptions.SUB_AREAS, [])
+        if config.inpaintMode.value == InpaintMode.FIXED_WATERMARK:
+            normalized_areas = self._sanitize_normalized_areas(
+                self.task_list_component.get_task_option(
+                    index, TaskOptions.FIXED_WATERMARK_AREAS, []
+                )
+            )
+            loaded_from_config = False
+            if not normalized_areas:
+                normalized_areas = self._parse_fixed_watermark_areas(
+                    config.fixedWatermarkSelectionAreas.value
+                )
+                if normalized_areas:
+                    loaded_from_config = True
+                    self.task_list_component.update_task_option(
+                        index,
+                        TaskOptions.FIXED_WATERMARK_AREAS,
+                        normalized_areas,
+                    )
+            if loaded_from_config:
+                self._propagate_fixed_watermark_areas(index, normalized_areas)
+            self._selection_change_source = "fixed_config"
+            try:
+                self.video_display_component.set_selection_rects(
+                    self.video_display_component.normalized_video_coordinates_to_preview_coordinates(
+                        normalized_areas
+                    )
+                )
+            finally:
+                self._selection_change_source = None
+            return
         if len(selections) <= 0:
             self._selection_change_source = "default"
             try:
@@ -463,9 +620,9 @@ class HomeInterface(QWidget):
             if self.current_processing_task_index >= 0:
                 self.task_list_component.update_task_status(self.current_processing_task_index, TaskStatus.PENDING)
         finally:
+            self._is_processing = False
             self.running_process = None
-            self.run_button.setVisible(True)
-            self.stop_button.setVisible(False)
+            self._toggle_buttons(True)
             self.current_processing_batch_id = None
             self.current_processing_task_start_time = None
             self.current_processing_run_start_time = None
@@ -533,15 +690,81 @@ class HomeInterface(QWidget):
     @Slot(bool)
     def _toggle_buttons(self, show_run):
         """线程安全地切换按钮可见性"""
+        self._is_processing = not show_run
         self.run_button.setVisible(show_run)
         self.stop_button.setVisible(not show_run)
+        self.video_display_component.set_dragger_enabled(show_run)
+        self.task_list_component.setEnabled(show_run)
+        self.file_button.setEnabled(show_run)
+        self.folder_button.setEnabled(show_run)
+        self.batch_folder_button.setEnabled(show_run)
+        self.auto_area_button.setEnabled(
+            show_run
+            and not self._auto_area_button_running
+            and config.inpaintMode.value != InpaintMode.FIXED_WATERMARK
+        )
+        self.setting_interface.set_inpaint_mode_enabled(
+            show_run and self._saved_inpaint_mode is None
+        )
 
     @Slot(bool)
     def set_auto_area_button_running(self, running):
-        self.auto_area_button.setEnabled(not running)
+        self._auto_area_button_running = running
+        fixed_watermark_mode = config.inpaintMode.value == InpaintMode.FIXED_WATERMARK
+        self.auto_area_button.setEnabled(not running and not fixed_watermark_mode)
         self.auto_area_button.setText("识别中..." if running else "自动框选")
 
+    @Slot(object)
+    def on_inpaint_mode_changed(self, mode):
+        fixed_watermark_mode = mode == InpaintMode.FIXED_WATERMARK
+        self.setting_interface.set_subtitle_controls_enabled(not fixed_watermark_mode)
+        self.auto_area_button.setEnabled(
+            not self._auto_area_button_running and not fixed_watermark_mode
+        )
+        task_index = self.task_list_component.get_current_task_index()
+        if task_index < 0:
+            return
+
+        if fixed_watermark_mode:
+            normalized_areas = self._sanitize_normalized_areas(
+                self.task_list_component.get_task_option(
+                    task_index, TaskOptions.FIXED_WATERMARK_AREAS, []
+                )
+            )
+            if not normalized_areas:
+                normalized_areas = self._parse_fixed_watermark_areas(
+                    config.fixedWatermarkSelectionAreas.value
+                )
+                if normalized_areas:
+                    self.task_list_component.update_task_option(
+                        task_index,
+                        TaskOptions.FIXED_WATERMARK_AREAS,
+                        normalized_areas,
+                    )
+            if normalized_areas:
+                self._propagate_fixed_watermark_areas(task_index, normalized_areas)
+            self.video_display_component.set_selection_rects(
+                self.video_display_component.normalized_video_coordinates_to_preview_coordinates(
+                    normalized_areas
+                )
+            )
+            return
+
+        subtitle_areas = self.task_list_component.get_task_option(
+            task_index, TaskOptions.SUB_AREAS, []
+        )
+        if subtitle_areas:
+            self.video_display_component.set_selection_rects(subtitle_areas)
+            return
+        self._selection_change_source = "default"
+        try:
+            self.video_display_component.load_selections_from_config()
+        finally:
+            self._selection_change_source = None
+
     def _task_needs_auto_area(self, task_index, video_path):
+        if config.inpaintMode.value == InpaintMode.FIXED_WATERMARK:
+            return False
         subtitle_areas = self.task_list_component.get_task_option(task_index, TaskOptions.SUB_AREAS, [])
         subtitle_areas_source = self.task_list_component.get_task_option(task_index, TaskOptions.SUB_AREAS_SOURCE, "")
         return (
@@ -574,6 +797,15 @@ class HomeInterface(QWidget):
                 self._auto_area_results[video_path] = result
                 self._auto_area_futures.pop(video_path, None)
                 self._auto_area_errors.pop(video_path, None)
+            current_task_index = self.task_list_component.find_task_index_by_path(video_path)
+            if current_task_index >= 0:
+                subtitle_areas_video, _ = result
+                self._schedule_subtitle_interval_detection(
+                    current_task_index,
+                    video_path,
+                    subtitle_areas_video,
+                    self.task_list_component.get_task_option(current_task_index, TaskOptions.AB_SECTIONS, []),
+                )
 
         future.add_done_callback(_done_callback)
 
@@ -586,6 +818,68 @@ class HomeInterface(QWidget):
             result = self._auto_area_results.get(video_path)
             future = self._auto_area_futures.get(video_path)
             error = self._auto_area_errors.get(video_path)
+        return result, future, error
+
+    def _task_needs_subtitle_intervals(self, task_index, video_path):
+        intervals = self.task_list_component.get_task_option(task_index, TaskOptions.SUBTITLE_INTERVALS, None)
+        return (
+            config.inpaintMode.value == InpaintMode.STTN_AUTO
+            and not is_image_file(video_path)
+            and intervals is None
+        )
+
+    def _schedule_subtitle_interval_detection(self, task_index, video_path, subtitle_areas_video, ab_sections=None):
+        if not subtitle_areas_video or not self._task_needs_subtitle_intervals(task_index, video_path):
+            return
+
+        with self._auto_area_lock:
+            if video_path in self._subtitle_interval_results or video_path in self._subtitle_interval_futures:
+                return
+            self._subtitle_interval_errors.pop(video_path, None)
+            future = self.auto_area_executor.submit(
+                detect_subtitle_intervals,
+                video_path,
+                subtitle_areas_video,
+                ab_sections,
+            )
+            self._subtitle_interval_futures[video_path] = future
+
+        def _done_callback(done_future):
+            try:
+                result = done_future.result()
+            except Exception as e:
+                with self._auto_area_lock:
+                    self._subtitle_interval_errors[video_path] = str(e)
+                    self._subtitle_interval_futures.pop(video_path, None)
+                return
+
+            with self._auto_area_lock:
+                self._subtitle_interval_results[video_path] = result
+                self._subtitle_interval_futures.pop(video_path, None)
+                self._subtitle_interval_errors.pop(video_path, None)
+
+        future.add_done_callback(_done_callback)
+
+    def _schedule_pending_subtitle_interval_detections(self):
+        if config.inpaintMode.value != InpaintMode.STTN_AUTO:
+            return
+        for task_index, task in self.task_list_component.get_pending_tasks():
+            result, _, _ = self._get_auto_area_detection_result(task.path)
+            if result is None:
+                continue
+            subtitle_areas_video, _ = result
+            self._schedule_subtitle_interval_detection(
+                task_index,
+                task.path,
+                subtitle_areas_video,
+                self.task_list_component.get_task_option(task_index, TaskOptions.AB_SECTIONS, []),
+            )
+
+    def _get_subtitle_interval_result(self, video_path):
+        with self._auto_area_lock:
+            result = self._subtitle_interval_results.get(video_path)
+            future = self._subtitle_interval_futures.get(video_path)
+            error = self._subtitle_interval_errors.get(video_path)
         return result, future, error
 
     def _apply_detected_areas_to_task(self, task_index, detected_areas, confidence, source="auto", log_prefix=""):
@@ -607,6 +901,9 @@ class HomeInterface(QWidget):
     def auto_area_button_clicked(self):
         if not self.video_path:
             self.append_output(tr['SubtitleExtractorGUI']['OpenVideoFirst'])
+            return
+        if config.inpaintMode.value == InpaintMode.FIXED_WATERMARK:
+            self.append_output(tr['Main']['FixedWatermarkAreaRequired'])
             return
 
         current_task_index = self.task_list_component.get_current_task_index()
@@ -636,6 +933,8 @@ class HomeInterface(QWidget):
 
     @Slot(list, float)
     def on_auto_subtitle_area_detected(self, areas, confidence):
+        if config.inpaintMode.value == InpaintMode.FIXED_WATERMARK:
+            return
         if not areas:
             self.append_output("自动框选失败: 未找到可用字幕区域")
             return
@@ -652,15 +951,32 @@ class HomeInterface(QWidget):
         if current_task_index >= 0:
             self.task_list_component.update_task_option(current_task_index, TaskOptions.SUB_AREAS, preview_areas)
             self.task_list_component.update_task_option(current_task_index, TaskOptions.SUB_AREAS_SOURCE, "auto")
+            self.task_list_component.update_task_option(current_task_index, TaskOptions.SUBTITLE_INTERVALS, None)
+            self._schedule_subtitle_interval_detection(current_task_index, self.video_path, areas, self.task_list_component.get_task_option(current_task_index, TaskOptions.AB_SECTIONS, []))
 
         if confidence <= 0:
             self.append_output(f"未检测到稳定字幕，已使用默认底部区域: {areas}")
         else:
             self.append_output(f"自动框选完成: {areas}, 置信度 {confidence:.2f}")
 
-    def ensure_subtitle_areas_before_run(self, task_index, video_path):
+    def ensure_subtitle_areas_before_run(self, task_index, video_path, inpaint_mode=None):
+        inpaint_mode = inpaint_mode or config.inpaintMode.value
         subtitle_areas = self.task_list_component.get_task_option(task_index, TaskOptions.SUB_AREAS, [])
         subtitle_areas_source = self.task_list_component.get_task_option(task_index, TaskOptions.SUB_AREAS_SOURCE, "")
+        if inpaint_mode == InpaintMode.FIXED_WATERMARK:
+            normalized_areas = self._sanitize_normalized_areas(
+                self.task_list_component.get_task_option(
+                    task_index, TaskOptions.FIXED_WATERMARK_AREAS, []
+                )
+            )
+            if not normalized_areas:
+                raise ValueError(tr['Main']['FixedWatermarkAreaRequired'])
+            preview_areas = self.video_display_component.normalized_video_coordinates_to_preview_coordinates(
+                normalized_areas
+            )
+            if not preview_areas:
+                raise ValueError(tr['Main']['FixedWatermarkAreaRequired'])
+            return preview_areas
         should_auto_detect = self._task_needs_auto_area(task_index, video_path)
         if subtitle_areas and len(subtitle_areas) > 0 and not should_auto_detect:
             return subtitle_areas
@@ -703,10 +1019,66 @@ class HomeInterface(QWidget):
         self.task_list_component.update_task_option(task_index, TaskOptions.SUB_AREAS_SOURCE, "fallback")
         return subtitle_areas
 
+    def ensure_subtitle_intervals_before_run(self, task_index, video_path, subtitle_areas_video, inpaint_mode=None):
+        inpaint_mode = inpaint_mode or config.inpaintMode.value
+        if inpaint_mode != InpaintMode.STTN_AUTO or is_image_file(video_path):
+            return None
+
+        intervals = self.task_list_component.get_task_option(task_index, TaskOptions.SUBTITLE_INTERVALS, None)
+        if intervals is not None:
+            return intervals
+
+        ab_sections = self.task_list_component.get_task_option(task_index, TaskOptions.AB_SECTIONS, [])
+        try:
+            result, future, error = self._get_subtitle_interval_result(video_path)
+            if result is None and future is None and error is None:
+                self._schedule_subtitle_interval_detection(task_index, video_path, subtitle_areas_video, ab_sections)
+                result, future, error = self._get_subtitle_interval_result(video_path)
+
+            if result is None and future is not None:
+                self.append_log_signal.emit([f"运行前等待字幕区间分析: {os.path.basename(video_path)}"])
+                intervals = future.result()
+                with self._auto_area_lock:
+                    self._subtitle_interval_results[video_path] = intervals
+                    self._subtitle_interval_futures.pop(video_path, None)
+                    self._subtitle_interval_errors.pop(video_path, None)
+            elif result is not None:
+                intervals = result
+            else:
+                raise RuntimeError(error or "字幕区间分析失败")
+
+            self.task_list_component.update_task_option(task_index, TaskOptions.SUBTITLE_INTERVALS, intervals)
+            interval_frame_count = sum(max(0, end - start + 1) for start, end in intervals)
+            skip_frame_count = max(0, self.frame_count - interval_frame_count) if self.frame_count else 0
+            skip_ratio = (skip_frame_count / self.frame_count * 100) if self.frame_count else 0
+            self.append_log_signal.emit([
+                f"运行前字幕区间分析完成: {len(intervals)} 个区间, 跳过无字幕帧 {skip_frame_count}/{self.frame_count} ({skip_ratio:.1f}%)"
+            ])
+            return intervals
+        except Exception as e:
+            traceback.print_exc()
+            self.append_log_signal.emit([f"运行前字幕区间分析失败: {e}"])
+            self.task_list_component.update_task_option(task_index, TaskOptions.SUBTITLE_INTERVALS, [])
+            return []
+
     def run_button_clicked(self):
-        if not self.task_list_component.get_pending_tasks():
+        run_mode = config.inpaintMode.value
+        pending_tasks = self.task_list_component.get_pending_tasks()
+        if not pending_tasks:
             self.append_output(tr['SubtitleExtractorGUI']['OpenVideoFirst'])
             return
+        if run_mode == InpaintMode.FIXED_WATERMARK:
+            missing_selection = [
+                (index, task)
+                for index, task in pending_tasks
+                if not self._sanitize_normalized_areas(
+                    task.options.get(TaskOptions.FIXED_WATERMARK_AREAS.value)
+                )
+            ]
+            if missing_selection:
+                self.task_list_component.select_task(missing_selection[0][0])
+                self.append_output(tr['Main']['FixedWatermarkAreaRequired'])
+                return
 
         try:
             # 获取所有待执行的任务
@@ -715,19 +1087,25 @@ class HomeInterface(QWidget):
                 return
 
             self._stop_event.clear()
+            self._is_processing = True
+            self.setting_interface.set_inpaint_mode_enabled(False)
             self.toggle_buttons_signal.emit(False)
             # 开启后台线程处理视频
             def task():
                 try:
                     self.append_log_signal.emit(["初始化处理引擎..."])
                     self._ensure_subtitle_worker()
-                    self._schedule_pending_auto_area_detections()
+                    if run_mode != InpaintMode.FIXED_WATERMARK:
+                        self._schedule_pending_auto_area_detections()
+                        self._schedule_pending_subtitle_interval_detections()
                     while not self._stop_event.is_set():
                         try:
                             pending_tasks = self.task_list_component.get_pending_tasks()
                             if not pending_tasks:
                                 break
-                            self._schedule_pending_auto_area_detections()
+                            if run_mode != InpaintMode.FIXED_WATERMARK:
+                                self._schedule_pending_auto_area_detections()
+                                self._schedule_pending_subtitle_interval_detections()
                             current_batch_id = pending_tasks[0][1].batch_id
                             batch_tasks = self.task_list_component.get_pending_tasks_by_batch(current_batch_id)
                             pending_task = batch_tasks[0] if batch_tasks else pending_tasks[0]
@@ -751,13 +1129,33 @@ class HomeInterface(QWidget):
                                 )
                                 continue
 
-                            # 获取字幕区域坐标，未选择则使用全屏
-                            subtitle_areas = self.ensure_subtitle_areas_before_run(
+                            # 固定水印使用视频归一化坐标，避免依赖运行中的预览窗口状态
+                            if run_mode == InpaintMode.FIXED_WATERMARK:
+                                normalized_areas = task_item.options.get(
+                                    TaskOptions.FIXED_WATERMARK_AREAS.value, []
+                                )
+                                subtitle_areas_video = self._normalized_areas_to_video_coordinates(
+                                    normalized_areas,
+                                    self._get_video_dimensions(task_item.path),
+                                )
+                                if not subtitle_areas_video:
+                                    raise ValueError(tr['Main']['FixedWatermarkAreaRequired'])
+                            else:
+                                subtitle_areas = self.ensure_subtitle_areas_before_run(
+                                    self.current_processing_task_index,
+                                    task_item.path,
+                                    run_mode,
+                                )
+                                subtitle_areas_video = self.video_display_component.preview_coordinates_to_video_coordinates(subtitle_areas)
+                            subtitle_intervals = self.ensure_subtitle_intervals_before_run(
                                 self.current_processing_task_index,
-                                task_item.path
+                                task_item.path,
+                                subtitle_areas_video,
+                                run_mode,
                             )
 
-                            self.video_display_component.save_selections_to_config()
+                            if run_mode != InpaintMode.FIXED_WATERMARK:
+                                self.video_display_component.save_selections_to_config()
 
                             # 更新任务状态为运行中
                             self.task_list_component.update_task_progress(self.current_processing_task_index, 1)
@@ -773,12 +1171,22 @@ class HomeInterface(QWidget):
                             self.task_status_signal.emit(self.current_processing_task_index, TaskStatus.PROCESSING)
                             options = {}
                             for key in task_item.options:
-                                if key == TaskOptions.SUB_AREAS_SOURCE.value:
+                                if key in (
+                                    TaskOptions.SUB_AREAS_SOURCE.value,
+                                    TaskOptions.SUB_AREAS.value,
+                                    TaskOptions.FIXED_WATERMARK_AREAS.value,
+                                ):
                                     continue
-                                value = task_item.options[key]
-                                if key == TaskOptions.SUB_AREAS.value:
-                                    value = self.video_display_component.preview_coordinates_to_video_coordinates(value)
-                                options[key] = value
+                                if (
+                                    run_mode == InpaintMode.FIXED_WATERMARK
+                                    and key == TaskOptions.SUBTITLE_INTERVALS.value
+                                ):
+                                    continue
+                                options[key] = task_item.options[key]
+                            options[TaskOptions.SUB_AREAS.value] = subtitle_areas_video
+                            if subtitle_intervals is not None:
+                                options[TaskOptions.SUBTITLE_INTERVALS.value] = subtitle_intervals
+                            options["inpaint_mode"] = run_mode
                             # 清理缓存, 使用动态路径
                             task_item.output_path = None
                             output_path = task_item.output_path
@@ -839,11 +1247,16 @@ class HomeInterface(QWidget):
                                     self.video_cap.release()
                                     self.video_cap = None
                 finally:
+                    if config.inpaintMode.value != run_mode:
+                        config.set(config.inpaintMode, run_mode)
+                    self._saved_inpaint_mode = None
                     self.toggle_buttons_signal.emit(True)
 
             self._worker_thread = threading.Thread(target=task, daemon=True)
             self._worker_thread.start()
         except Exception as e:
+            self._is_processing = False
+            self.setting_interface.set_inpaint_mode_enabled(self._saved_inpaint_mode is None)
             print(traceback.format_exc())
             self.append_log_signal.emit([f"Error: {e}"])
             self.toggle_buttons_signal.emit(True)
@@ -861,6 +1274,10 @@ class HomeInterface(QWidget):
         sr = None
         try:
             from backend.main import SubtitleRemover
+            options = dict(options)
+            inpaint_mode = options.pop("inpaint_mode", None)
+            if inpaint_mode is not None:
+                config.inpaintMode.value = inpaint_mode
             sr = SubtitleRemover(video_path, True)
             sr.video_out_path = output_path
             for key in options:
@@ -1046,11 +1463,12 @@ class HomeInterface(QWidget):
             self.frame_height = int(self.video_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
             self.frame_width = int(self.video_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
             self.fps = self.video_cap.get(cv2.CAP_PROP_FPS)
+            self._video_dimension_cache[video_path] = (self.frame_width, self.frame_height)
 
         self.update_preview(frame)
         self.video_slider.setMaximum(self.frame_count)
         self.video_slider.setValue(1)
-        self.video_display_component.set_dragger_enabled(True)
+        self.video_display_component.set_dragger_enabled(not self._is_processing)
         # 视频模式下恢复用户原始的 inpaint 模式选择
         self._unlock_inpaint_mode()
         return True
@@ -1066,11 +1484,12 @@ class HomeInterface(QWidget):
         self.frame_count = 1
         self.frame_height = frame.shape[0]
         self.frame_width = frame.shape[1]
+        self._video_dimension_cache[path] = (self.frame_width, self.frame_height)
         self.fps = 1
         self.update_preview(frame)
         self.video_slider.setMaximum(self.frame_count)
         self.video_slider.setValue(1)
-        self.video_display_component.set_dragger_enabled(True)
+        self.video_display_component.set_dragger_enabled(not self._is_processing)
         # 图片模式锁定为 LAMA
         self._lock_inpaint_mode_to_lama()
         return True
@@ -1087,9 +1506,9 @@ class HomeInterface(QWidget):
         if self._saved_inpaint_mode is not None:
             config.set(config.inpaintMode, self._saved_inpaint_mode)
             self._saved_inpaint_mode = None
-        self.setting_interface.set_inpaint_mode_enabled(True)
+        self.setting_interface.set_inpaint_mode_enabled(not self._is_processing)
         self.video_slider.setValue(1)
-        self.video_display_component.set_dragger_enabled(True)
+        self.video_display_component.set_dragger_enabled(not self._is_processing)
         return True
 
 

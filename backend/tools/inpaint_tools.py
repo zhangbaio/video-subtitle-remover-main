@@ -316,8 +316,13 @@ def is_frame_number_in_ab_sections(frame_no, ab_sections):
     if len(ab_sections) <= 0:
         return True
     for section in ab_sections:
-        if frame_no in section:
-            return True
+        if isinstance(section, range):
+            if frame_no in section:
+                return True
+            continue
+        if isinstance(section, (tuple, list)) and len(section) >= 2:
+            if section[0] <= frame_no <= section[1]:
+                return True
     return False
 
 if __name__ == '__main__':

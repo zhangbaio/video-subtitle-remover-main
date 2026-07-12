@@ -18,7 +18,7 @@ from backend.inpaint.sttn.auto_sttn import InpaintGenerator
 from backend.inpaint.utils.sttn_utils import Stack, ToTorchFormatTensor
 from backend.tools.hardware_accelerator import HardwareAccelerator
 from backend.tools.inpaint_tools import get_inpaint_area_by_mask, is_frame_number_in_ab_sections
-from backend.tools.video_io import FramePrefetcher
+from backend.tools.video_io import FramePrefetcher, create_processing_capture
 
 
 _to_tensors = transforms.Compose([
@@ -33,6 +33,8 @@ class STTNInpaint:
         self.model = InpaintGenerator().to(self.device)
         self.model.load_state_dict(torch.load(model_path, map_location="cpu")["netG"])
         self.model.eval()
+        if getattr(self.device, "type", "") == "cuda":
+            torch.backends.cudnn.benchmark = True
         self.model_input_width, self.model_input_height = 640, 120
         self.neighbor_stride = config.sttnNeighborStride.value
         self.ref_length = config.sttnReferenceLength.value
@@ -96,7 +98,7 @@ class STTNInpaint:
         feats = feats.to(self.device)
         comp_frames = [None] * frame_length
 
-        with torch.no_grad():
+        with torch.inference_mode():
             feats = self.model.encoder(
                 feats.view(frame_length, 3, self.model_input_height, self.model_input_width)
             )
@@ -158,6 +160,17 @@ class STTNAutoInpaint:
 
         try:
             reader, frame_info = self.read_frame_info_from_video()
+            read_cap = create_processing_capture(
+                self.video_path,
+                frame_info["W_ori"],
+                frame_info["H_ori"],
+                fps=frame_info["fps"],
+                frame_count=frame_info["len"],
+                fallback_cap=reader,
+            )
+            if read_cap is not reader:
+                reader.release()
+                reader = read_cap
             prefetcher = FramePrefetcher(reader)
 
             if input_sub_remover is not None:
@@ -292,12 +305,14 @@ class STTNAutoInpaint:
                                 input_sub_remover.push_preview_with_comp(original_frame, frame)
 
                 del frames_hr, frames, comps
-                gc.collect()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+                if i % 8 == 7:
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
 
         except Exception as e:
             print(f"Error during video processing: {str(e)}")
+            raise
         finally:
             if prefetcher:
                 prefetcher.release()

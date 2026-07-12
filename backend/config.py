@@ -41,6 +41,8 @@ class Config(QConfig):
     # 使用一个配置项存储所有选区
     # 默认值为一个选区，格式为："ymin,ymax,xmin,xmax;ymin,ymax,xmin,xmax;..."，分号分隔不同选区
     subtitleSelectionAreas = ConfigItem("Main", "SubtitleSelectionAreas", "0.88,0.99,0.15,0.85")
+    # 固定水印使用独立选区，避免覆盖或误用默认字幕区域
+    fixedWatermarkSelectionAreas = ConfigItem("Main", "FixedWatermarkSelectionAreas", "")
 
     """
     MODE可选算法类型
@@ -48,6 +50,7 @@ class Config(QConfig):
     - InpaintMode.STTN_DET 带字幕检测版, 无智能擦除
     - InpaintMode.LAMA 算法：对于动画类视频效果好，速度一般，不可以跳过字幕检测
     - InpaintMode.PROPAINTER 算法： 需要消耗大量显存，速度较慢，对运动非常剧烈的视频效果较好
+    - InpaintMode.FIXED_WATERMARK 固定水印：手工选区作为真实遮罩，ProPainter全帧修复
     """
     # 【设置inpaint算法】
     inpaintMode = OptionsConfigItem("Main", "InpaintMode", InpaintMode.STTN_AUTO, OptionsValidator(InpaintMode), EnumSerializer(InpaintMode))
