@@ -1,6 +1,7 @@
 import multiprocessing
 import queue as queue_module
 import threading
+import traceback
 from enum import Enum
 
 
@@ -12,6 +13,7 @@ class Command(Enum):
     ERROR = 4
     UPDATE_PREVIEW_WITH_COMP = 5
     SHUTDOWN = 6
+    PROCESSING_PHASE = 7
 
 
 class SubtitleRemoverRemoteCall:
@@ -42,7 +44,12 @@ class SubtitleRemoverRemoteCall:
                     self.job_had_error = True
                 callback = self.callbacks.get(cmd)
                 if callback:
-                    callback(*args)
+                    try:
+                        callback(*args)
+                    except Exception:
+                        # A UI callback must not kill the dispatcher and leave
+                        # the worker/job-finished handshake permanently stuck.
+                        traceback.print_exc()
         finally:
             self.running = False
             self.job_finished_event.set()
@@ -78,6 +85,9 @@ class SubtitleRemoverRemoteCall:
     def register_error_callback(self, callback):
         self.callbacks[Command.ERROR] = callback
 
+    def register_processing_phase_callback(self, callback):
+        self.callbacks[Command.PROCESSING_PHASE] = callback
+
     @staticmethod
     def remote_call_update_progress(queue, progress, isFinished):
         queue.put((Command.PROGRESS, (progress, isFinished)))
@@ -105,3 +115,7 @@ class SubtitleRemoverRemoteCall:
     @staticmethod
     def remote_call_update_preview_with_comp(queue, *args):
         queue.put((Command.UPDATE_PREVIEW_WITH_COMP, (*args,)))
+
+    @staticmethod
+    def remote_call_processing_phase(queue, phase, video_path):
+        queue.put((Command.PROCESSING_PHASE, (phase, video_path)))

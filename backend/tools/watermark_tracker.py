@@ -1,11 +1,22 @@
+import hashlib
+import json
+import os
 import subprocess
+import threading
+import time
 from collections import deque
 
 import cv2
 import numpy as np
 
+from backend.scenedetect.detectors import ContentDetector
+from backend.scenedetect.scene_manager import compute_downscale_factor
 from backend.tools.common_tools import get_readable_path
 from backend.tools.ffmpeg_cli import FFmpegCLI
+
+
+MOVING_WATERMARK_PREPROCESS_SCHEMA = 1
+MOVING_WATERMARK_TRACKER_VERSION = 2
 
 
 def clamp_area(area, frame_shape):
@@ -363,3 +374,452 @@ def smooth_tracking_results(areas, scores, fps=0.0):
             )
 
     return smoothed, scores
+
+
+def _file_signature(path):
+    path = os.path.normcase(os.path.realpath(os.path.abspath(os.fspath(path))))
+    stat = os.stat(path)
+    return {
+        "path": path,
+        "size": int(stat.st_size),
+        "mtime_ns": int(stat.st_mtime_ns),
+    }
+
+
+def canonicalize_ab_sections(ab_sections, frame_count):
+    """Return merged inclusive frame intervals, or None for the full video."""
+    if not ab_sections:
+        return None
+    frame_count = max(0, int(frame_count or 0))
+    intervals = []
+    for section in ab_sections:
+        if isinstance(section, range):
+            start, end = section.start, section.stop - 1
+        elif isinstance(section, (tuple, list)) and len(section) >= 2:
+            start, end = section[0], section[1]
+        else:
+            raise ValueError("Invalid A/B section in moving-watermark preprocessing")
+        start, end = int(start), int(end)
+        if frame_count:
+            start = max(0, min(frame_count - 1, start))
+            end = max(0, min(frame_count - 1, end))
+        if end < start:
+            continue
+        intervals.append((start, end))
+    intervals.sort()
+    merged = []
+    for start, end in intervals:
+        if merged and start <= merged[-1][1] + 1:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    return tuple(merged)
+
+
+def _frame_is_active(frame_no, canonical_ab_sections):
+    if canonical_ab_sections is None:
+        return True
+    return any(start <= frame_no <= end for start, end in canonical_ab_sections)
+
+
+def build_moving_watermark_preprocess_key(
+    video_path,
+    template_source_path,
+    reference_frame_no,
+    template_area,
+    frame_shape,
+    frame_count,
+    fps,
+    ab_sections=None,
+    fallback_target_area=None,
+):
+    height, width = map(int, frame_shape[:2])
+    area = template_area
+    if isinstance(area, (list, tuple)) and len(area) == 1:
+        area = area[0]
+    normalized_area = None
+    if isinstance(area, (list, tuple)) and len(area) == 4:
+        normalized_area = [round(float(value), 8) for value in area]
+    fallback_area = None
+    if isinstance(fallback_target_area, (list, tuple)) and len(fallback_target_area) == 4:
+        fallback_area = [int(value) for value in fallback_target_area]
+    canonical_ab = canonicalize_ab_sections(ab_sections, frame_count)
+    payload = {
+        "schema": MOVING_WATERMARK_PREPROCESS_SCHEMA,
+        "tracker_version": MOVING_WATERMARK_TRACKER_VERSION,
+        "video": _file_signature(video_path),
+        "template": _file_signature(template_source_path),
+        "reference_frame_no": int(reference_frame_no or 0),
+        "template_area": normalized_area,
+        "fallback_target_area": fallback_area,
+        "height": height,
+        "width": width,
+        "frame_count": int(frame_count or 0),
+        "fps": round(float(fps or 0.0), 6),
+        "ab_sections": canonical_ab,
+    }
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _build_tracker_for_preprocess(
+    reference_frame,
+    template_area,
+    target_shape,
+    fallback_target_area=None,
+):
+    source_height, source_width = reference_frame.shape[:2]
+    area = template_area
+    if isinstance(area, (list, tuple)) and len(area) == 1:
+        area = area[0]
+    if isinstance(area, (list, tuple)) and len(area) == 4:
+        values = tuple(map(float, area))
+        if all(0.0 <= value <= 1.0 for value in values):
+            selected_area = (
+                round(values[0] * source_height),
+                round(values[1] * source_height),
+                round(values[2] * source_width),
+                round(values[3] * source_width),
+            )
+        else:
+            selected_area = tuple(map(int, values))
+    elif isinstance(fallback_target_area, (list, tuple)) and len(fallback_target_area) == 4:
+        target_height, target_width = target_shape[:2]
+        selected_area = (
+            round(fallback_target_area[0] / max(1, target_height) * source_height),
+            round(fallback_target_area[1] / max(1, target_height) * source_height),
+            round(fallback_target_area[2] / max(1, target_width) * source_width),
+            round(fallback_target_area[3] / max(1, target_width) * source_width),
+        )
+    else:
+        raise ValueError("Moving watermark template is required")
+
+    refined_area = refine_watermark_area(reference_frame, selected_area)
+    if refined_area is None:
+        raise ValueError("Moving watermark template is required")
+    ymin, ymax, xmin, xmax = refined_area
+    target_height, target_width = target_shape[:2]
+    target_area = (
+        round(ymin / source_height * target_height),
+        round(ymax / source_height * target_height),
+        round(xmin / source_width * target_width),
+        round(xmax / source_width * target_width),
+    )
+    tracker = MovingWatermarkTracker(
+        reference_frame[ymin:ymax, xmin:xmax].copy(),
+        target_area,
+        target_shape,
+        template_feature_frame=reference_frame,
+    )
+    return tracker, tuple(map(int, selected_area)), tuple(map(int, refined_area)), target_area
+
+
+def preprocess_moving_watermark(
+    video_path,
+    template_source_path,
+    reference_frame_no,
+    template_area,
+    frame_shape,
+    frame_count,
+    fps,
+    ab_sections=None,
+    fallback_target_area=None,
+    cancel_event=None,
+):
+    """Scan a video once for watermark tracking and scene boundaries.
+
+    A previous implementation opened the same video in two OpenCV readers so
+    tracking and scene detection could run in parallel.  Some Windows codec
+    combinations can leave both readers waiting forever.  Feeding both
+    detectors from this single decode pass is slightly more CPU-bound, but it
+    removes that unbounded wait and also avoids decoding every frame twice.
+    """
+    started_at = time.perf_counter()
+    height, width = map(int, frame_shape[:2])
+    expected_count = int(frame_count or 0)
+    artifact_key = build_moving_watermark_preprocess_key(
+        video_path,
+        template_source_path,
+        reference_frame_no,
+        template_area,
+        (height, width),
+        expected_count,
+        fps,
+        ab_sections,
+        fallback_target_area,
+    )
+    reference_frame = read_video_frame(template_source_path, reference_frame_no, fps)
+    if reference_frame is None:
+        raise ValueError("Unable to read moving watermark reference frame")
+    tracker, selected_area, refined_area, target_area = _build_tracker_for_preprocess(
+        reference_frame,
+        template_area,
+        (height, width),
+        fallback_target_area,
+    )
+    canonical_ab = canonicalize_ab_sections(ab_sections, expected_count)
+    cap = cv2.VideoCapture(get_readable_path(video_path) or video_path)
+    if not cap.isOpened():
+        cap.release()
+        raise ValueError("Unable to open video for moving watermark preprocessing")
+    actual_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    actual_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    if (actual_height, actual_width) != (height, width):
+        cap.release()
+        raise ValueError("Moving watermark preprocessing video dimensions changed")
+
+    if cancel_event is not None and cancel_event.is_set():
+        cap.release()
+        raise RuntimeError("Moving watermark preprocessing cancelled")
+    scene_detector = ContentDetector()
+    scene_downscale = compute_downscale_factor(width)
+    scene_starts = []
+    areas = []
+    scores = []
+    frame_no = 0
+    was_active = False
+    try:
+        while True:
+            if cancel_event is not None and cancel_event.is_set():
+                raise RuntimeError("Moving watermark preprocessing cancelled")
+            ok, frame = cap.read()
+            if not ok:
+                break
+            scene_frame = frame
+            if scene_downscale > 1:
+                scene_frame = cv2.resize(
+                    frame,
+                    (
+                        round(frame.shape[1] / scene_downscale),
+                        round(frame.shape[0] / scene_downscale),
+                    ),
+                    interpolation=cv2.INTER_LINEAR,
+                )
+            scene_starts.extend(scene_detector.process_frame(frame_no, scene_frame))
+            if not _frame_is_active(frame_no, canonical_ab):
+                areas.append(None)
+                scores.append(0.0)
+                tracker.last_area = None
+                tracker.position_history.clear()
+                was_active = False
+                frame_no += 1
+                continue
+            force_global = not was_active
+            allow_global = force_global or tracker.last_area is not None or frame_no % 12 == 0
+            area, score = tracker.locate(
+                frame,
+                force_global=force_global,
+                allow_global=allow_global,
+            )
+            areas.append(area)
+            scores.append(float(score))
+            was_active = True
+            frame_no += 1
+    finally:
+        cap.release()
+
+    if expected_count and frame_no != expected_count:
+        raise ValueError(
+            f"Moving watermark preprocessing decoded {frame_no} frames, expected {expected_count}"
+        )
+    areas, scores = smooth_tracking_results(areas, scores, fps)
+    scene_starts.extend(scene_detector.post_process(frame_no))
+    areas_array = np.full((frame_no, 4), -1, dtype=np.int32)
+    for index, area in enumerate(areas):
+        if area is not None:
+            areas_array[index] = np.asarray(area, dtype=np.int32)
+    scores_array = np.asarray(scores, dtype=np.float32)
+    scene_array = np.asarray(sorted(set(scene_starts)), dtype=np.int32)
+    return {
+        "schema": MOVING_WATERMARK_PREPROCESS_SCHEMA,
+        "key": artifact_key,
+        "width": width,
+        "height": height,
+        "frame_count": frame_no,
+        "fps": float(fps or 0.0),
+        "areas": areas_array,
+        "scores": scores_array,
+        "scene_starts": scene_array,
+        "selected_area": np.asarray(selected_area, dtype=np.int32),
+        "refined_area": np.asarray(refined_area, dtype=np.int32),
+        "target_area": np.asarray(target_area, dtype=np.int32),
+        "detected_count": int(np.count_nonzero(areas_array[:, 0] >= 0)),
+        "elapsed": float(time.perf_counter() - started_at),
+        "canonical_ab": canonical_ab,
+    }
+
+
+def save_moving_watermark_preprocess(result, output_path):
+    output_path = os.path.abspath(os.fspath(output_path))
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    temporary_path = f"{output_path}.{os.getpid()}.{threading.get_ident()}.tmp.npz"
+    try:
+        np.savez_compressed(
+            temporary_path,
+            schema=np.asarray(result["schema"], dtype=np.int32),
+            key=np.asarray(result["key"]),
+            width=np.asarray(result["width"], dtype=np.int32),
+            height=np.asarray(result["height"], dtype=np.int32),
+            frame_count=np.asarray(result["frame_count"], dtype=np.int64),
+            fps=np.asarray(result["fps"], dtype=np.float64),
+            areas=result["areas"],
+            scores=result["scores"],
+            scene_starts=result["scene_starts"],
+            selected_area=result["selected_area"],
+            refined_area=result["refined_area"],
+            target_area=result["target_area"],
+            detected_count=np.asarray(result["detected_count"], dtype=np.int64),
+            elapsed=np.asarray(result["elapsed"], dtype=np.float64),
+        )
+        os.replace(temporary_path, output_path)
+    finally:
+        if os.path.exists(temporary_path):
+            try:
+                os.remove(temporary_path)
+            except OSError:
+                pass
+    return output_path
+
+
+def load_moving_watermark_preprocess(
+    artifact_path,
+    expected_key,
+    frame_shape,
+    frame_count,
+    ab_sections=None,
+    fps=None,
+):
+    height, width = map(int, frame_shape[:2])
+    frame_count = int(frame_count or 0)
+    with np.load(os.fspath(artifact_path), allow_pickle=False) as artifact:
+        result = {name: artifact[name].copy() for name in artifact.files}
+    schema = int(result["schema"].item())
+    key = str(result["key"].item())
+    stored_width = int(result["width"].item())
+    stored_height = int(result["height"].item())
+    stored_count = int(result["frame_count"].item())
+    areas = result["areas"]
+    scores = result["scores"]
+    scene_starts = result["scene_starts"]
+    stored_fps = float(result["fps"].item())
+    if schema != MOVING_WATERMARK_PREPROCESS_SCHEMA or key != expected_key:
+        raise ValueError("Moving watermark preprocessing key mismatch")
+    if (stored_height, stored_width, stored_count) != (height, width, frame_count):
+        raise ValueError("Moving watermark preprocessing video metadata mismatch")
+    if fps is not None and abs(stored_fps - float(fps or 0.0)) > 1e-3:
+        raise ValueError("Moving watermark preprocessing frame rate mismatch")
+    if areas.dtype != np.int32 or areas.shape != (frame_count, 4):
+        raise ValueError("Invalid moving watermark preprocessing areas")
+    if scores.dtype != np.float32 or scores.shape != (frame_count,) or not np.all(np.isfinite(scores)):
+        raise ValueError("Invalid moving watermark preprocessing scores")
+    if np.any(scores < -1.001) or np.any(scores > 1.001):
+        raise ValueError("Moving watermark preprocessing score is out of range")
+    missing = np.all(areas == -1, axis=1)
+    partial_missing = np.any(areas == -1, axis=1) & ~missing
+    if np.any(partial_missing):
+        raise ValueError("Invalid moving watermark preprocessing sentinel")
+    valid = ~missing
+    if np.any(valid):
+        valid_areas = areas[valid]
+        if np.any(valid_areas[:, 0] < 0) or np.any(valid_areas[:, 1] > height):
+            raise ValueError("Moving watermark preprocessing area is out of bounds")
+        if np.any(valid_areas[:, 2] < 0) or np.any(valid_areas[:, 3] > width):
+            raise ValueError("Moving watermark preprocessing area is out of bounds")
+        if np.any(valid_areas[:, 1] <= valid_areas[:, 0]) or np.any(valid_areas[:, 3] <= valid_areas[:, 2]):
+            raise ValueError("Moving watermark preprocessing area is empty")
+    if scene_starts.dtype != np.int32 or scene_starts.ndim != 1:
+        raise ValueError("Invalid moving watermark preprocessing scene list")
+    if scene_starts.size and (
+        np.any(scene_starts < 0)
+        or np.any(scene_starts >= frame_count)
+        or not np.array_equal(scene_starts, np.unique(scene_starts))
+    ):
+        raise ValueError("Invalid moving watermark preprocessing scene frame")
+    target_area = result["target_area"]
+    if target_area.dtype != np.int32 or target_area.shape != (4,):
+        raise ValueError("Invalid moving watermark preprocessing target area")
+    target_height = int(target_area[1] - target_area[0])
+    target_width = int(target_area[3] - target_area[2])
+    if target_height <= 0 or target_width <= 0:
+        raise ValueError("Invalid moving watermark preprocessing target size")
+    if np.any(valid):
+        valid_areas = areas[valid]
+        if np.any(valid_areas[:, 1] - valid_areas[:, 0] != target_height):
+            raise ValueError("Moving watermark preprocessing height changed")
+        if np.any(valid_areas[:, 3] - valid_areas[:, 2] != target_width):
+            raise ValueError("Moving watermark preprocessing width changed")
+    if int(result["detected_count"].item()) != int(np.count_nonzero(valid)):
+        raise ValueError("Moving watermark preprocessing detection count mismatch")
+    for name in ("selected_area", "refined_area"):
+        template_box = result[name]
+        if template_box.dtype != np.int32 or template_box.shape != (4,):
+            raise ValueError(f"Invalid moving watermark preprocessing {name}")
+        if (
+            template_box[0] < 0
+            or template_box[2] < 0
+            or template_box[1] <= template_box[0]
+            or template_box[3] <= template_box[2]
+        ):
+            raise ValueError(f"Invalid moving watermark preprocessing {name}")
+    canonical_ab = canonicalize_ab_sections(ab_sections, frame_count)
+    if canonical_ab is not None:
+        active = np.zeros(frame_count, dtype=bool)
+        for start, end in canonical_ab:
+            active[start:end + 1] = True
+        if np.any(~active & valid) or np.any(scores[~active] != 0):
+            raise ValueError("Moving watermark preprocessing violates A/B sections")
+    result.update(
+        schema=schema,
+        key=key,
+        width=stored_width,
+        height=stored_height,
+        frame_count=stored_count,
+        fps=stored_fps,
+        detected_count=int(result["detected_count"].item()),
+        elapsed=float(result["elapsed"].item()),
+    )
+    return result
+
+
+def preprocess_moving_watermark_to_file(output_path, **kwargs):
+    expected_key = build_moving_watermark_preprocess_key(
+        kwargs["video_path"],
+        kwargs["template_source_path"],
+        kwargs["reference_frame_no"],
+        kwargs["template_area"],
+        kwargs["frame_shape"],
+        kwargs["frame_count"],
+        kwargs["fps"],
+        kwargs.get("ab_sections"),
+        kwargs.get("fallback_target_area"),
+    )
+    if os.path.isfile(output_path):
+        try:
+            cached = load_moving_watermark_preprocess(
+                output_path,
+                expected_key,
+                kwargs["frame_shape"],
+                kwargs["frame_count"],
+                kwargs.get("ab_sections"),
+                kwargs.get("fps"),
+            )
+            return {
+                "path": os.path.abspath(output_path),
+                "key": expected_key,
+                "frame_count": cached["frame_count"],
+                "detected_count": cached["detected_count"],
+                "elapsed": cached["elapsed"],
+                "reused": True,
+            }
+        except Exception:
+            pass
+    result = preprocess_moving_watermark(**kwargs)
+    save_moving_watermark_preprocess(result, output_path)
+    return {
+        "path": os.path.abspath(output_path),
+        "key": result["key"],
+        "frame_count": result["frame_count"],
+        "detected_count": result["detected_count"],
+        "elapsed": result["elapsed"],
+        "reused": False,
+    }

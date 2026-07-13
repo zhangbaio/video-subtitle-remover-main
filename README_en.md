@@ -23,6 +23,7 @@ It mainly implements the following functionalities:
 - Supports multi-selection of images for batch removal of watermark text
 - Supports fixed-watermark removal: tightly select a stationary logo/overlay and inpaint it with a real ProPainter mask, without OCR
 - Supports automatic moving-watermark tracking: seek to a clear reference frame and select one watermark; the app tracks moving or corner-switching positions throughout the video and leaves low-confidence/no-watermark frames untouched
+- During folder batches, once the current video enters GPU inpainting the CPU preprocesses exactly one next video; the following task can reuse its tracking and scene data immediately
 - Fast moving-watermark mode is enabled by default to reduce optical-flow work and dynamic-mask memory for compact logos; turn it off when maximum quality matters more than speed
 
 ![demo.png](https://github.com/YaoFANGUK/video-subtitle-remover/raw/main/design/demo.png)

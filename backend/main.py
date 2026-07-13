@@ -33,6 +33,9 @@ from backend.tools.subtitle_detect import SubtitleDetect
 from backend.tools.video_io import FramePrefetcher, FFmpegVideoWriter, create_processing_capture
 from backend.tools.watermark_tracker import (
     MovingWatermarkTracker,
+    build_moving_watermark_preprocess_key,
+    load_moving_watermark_preprocess,
+    preprocess_moving_watermark,
     read_video_frame,
     refine_watermark_area,
     smooth_tracking_results,
@@ -115,6 +118,8 @@ class SubtitleRemover:
         self.tracking_reference_frame_no = 0
         self.tracking_template_area = None
         self.tracking_template_source_path = None
+        self.moving_watermark_preprocess_path = None
+        self.report_processing_phase = lambda *args: None
         self.preview_emit_interval = 0.2 if gui_mode else 0.0
         self._last_preview_emit_time = 0.0
 
@@ -594,16 +599,72 @@ class SubtitleRemover:
 
     def moving_watermark_mode(self, tbar):
         """Track one watermark template and inpaint only confidently located frames."""
-        try:
-            scene_starts = {
-                max(0, frame_number - 1)
-                for frame_number in SubtitleDetect.get_scene_div_frame_no(self.video_path)
-            }
-        except Exception:
-            scene_starts = set()
-
-        tracker, _ = self._create_moving_watermark_tracker()
-        tracked_areas, _ = self._scan_moving_watermark(tracker)
+        template_source = self.tracking_template_source_path or self.video_path
+        if self.tracking_template_source_path and not os.path.isfile(template_source):
+            raise ValueError(tr['Main']['MovingWatermarkReferenceReadFailed'])
+        expected_key = build_moving_watermark_preprocess_key(
+            self.video_path,
+            template_source,
+            self.tracking_reference_frame_no,
+            self.tracking_template_area,
+            self.mask_size,
+            self.frame_count,
+            self.fps,
+            self.ab_sections,
+            self.sub_areas[0],
+        )
+        preprocess_result = None
+        if self.moving_watermark_preprocess_path:
+            try:
+                preprocess_result = load_moving_watermark_preprocess(
+                    self.moving_watermark_preprocess_path,
+                    expected_key,
+                    self.mask_size,
+                    self.frame_count,
+                    self.ab_sections,
+                    self.fps,
+                )
+                self.append_output(tr['Main']['MovingWatermarkPreprocessUsing'])
+            except Exception as error:
+                self.append_output(
+                    tr['Main']['MovingWatermarkPreprocessInvalid'].format(error)
+                )
+        if preprocess_result is None:
+            self.append_output(tr['Main']['ProcessingStartTrackingWatermark'])
+            preprocess_result = preprocess_moving_watermark(
+                self.video_path,
+                template_source,
+                self.tracking_reference_frame_no,
+                self.tracking_template_area,
+                self.mask_size,
+                self.frame_count,
+                self.fps,
+                self.ab_sections,
+                self.sub_areas[0],
+            )
+        selected_area = tuple(map(int, preprocess_result['selected_area']))
+        refined_area = tuple(map(int, preprocess_result['refined_area']))
+        if selected_area != refined_area:
+            self.append_output(
+                tr['Main']['MovingWatermarkTemplateRefined'].format(
+                    selected_area,
+                    refined_area,
+                )
+            )
+        tracked_area_array = preprocess_result['areas']
+        tracked_areas = [
+            None if row[0] < 0 else tuple(map(int, row))
+            for row in tracked_area_array
+        ]
+        scene_starts = set(map(int, preprocess_result['scene_starts']))
+        self.append_output(
+            tr['Main']['MovingWatermarkTrackingSummary'].format(
+                preprocess_result['detected_count'],
+                preprocess_result['frame_count'],
+                preprocess_result['elapsed'],
+            )
+        )
+        self.report_processing_phase("inpaint_started", self.video_path)
         self.append_output(tr['Main']['ProcessingStartRemovingMovingWatermark'])
 
         max_batch_size = max(2, int(config.propainterMaxLoadNum.value))
@@ -658,7 +719,9 @@ class SubtitleRemover:
                 ok, frame = reader.read()
                 if not ok:
                     break
-                area = tracked_areas[frame_no] if frame_no < len(tracked_areas) else None
+                if frame_no >= len(tracked_areas):
+                    raise ValueError("Video contains more frames than moving watermark preprocessing")
+                area = tracked_areas[frame_no]
 
                 if frame_no in scene_starts and pending_frames:
                     write_processed_batch()
@@ -681,6 +744,10 @@ class SubtitleRemover:
                     write_processed_batch(keep_overlap=True)
                 frame_no += 1
 
+            if frame_no != len(tracked_areas):
+                raise ValueError(
+                    f"Video decoded {frame_no} frames, expected {len(tracked_areas)}"
+                )
             write_processed_batch()
         finally:
             reader.release()

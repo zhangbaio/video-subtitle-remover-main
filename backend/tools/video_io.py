@@ -18,23 +18,48 @@ class FramePrefetcher:
     接口兼容 cv2.VideoCapture（read/release）。
     """
 
-    def __init__(self, video_cap, buffer_size=24):
+    def __init__(self, video_cap, buffer_size=24, read_timeout=30.0):
         self.cap = video_cap
         self._buffer = queue.Queue(maxsize=buffer_size)
         self._stopped = False
+        self._read_timeout = max(1.0, float(read_timeout))
+        self._reader_error = None
         self._thread = threading.Thread(target=self._read_loop, daemon=True)
         self._thread.start()
 
     def _read_loop(self):
-        while not self._stopped:
-            ret, frame = self.cap.read()
-            self._buffer.put((ret, frame))
-            if not ret:
-                break
+        try:
+            while not self._stopped:
+                ret, frame = self.cap.read()
+                self._buffer.put((ret, frame))
+                if not ret:
+                    break
+        except BaseException as error:
+            self._reader_error = error
+            # Wake a consumer already blocked in read(). If the buffer is
+            # full, queued frames are consumed before read() sees the error.
+            try:
+                self._buffer.put_nowait((False, None))
+            except queue.Full:
+                pass
 
     def read(self):
         """读取下一帧，接口与 cv2.VideoCapture.read() 一致。"""
-        return self._buffer.get()
+        if self._reader_error is not None:
+            raise RuntimeError("Video frame prefetch failed") from self._reader_error
+        try:
+            ret, frame = self._buffer.get(timeout=self._read_timeout)
+        except queue.Empty as error:
+            if self._reader_error is not None:
+                raise RuntimeError("Video frame prefetch failed") from self._reader_error
+            if not self._thread.is_alive():
+                raise RuntimeError("Video frame prefetch stopped before end of stream") from error
+            raise TimeoutError(
+                f"Timed out after {self._read_timeout:g}s waiting for the next video frame"
+            ) from error
+        if not ret and self._reader_error is not None:
+            raise RuntimeError("Video frame prefetch failed") from self._reader_error
+        return ret, frame
 
     def get(self, propId):
         return self.cap.get(propId)

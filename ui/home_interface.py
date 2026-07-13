@@ -3,9 +3,10 @@ import cv2
 import math
 import threading
 import multiprocessing
+import tempfile
 import time
 import traceback
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from collections import Counter
 from PySide6.QtWidgets import QWidget, QHBoxLayout, QVBoxLayout
 from PySide6.QtCore import Slot, QRect, Signal
@@ -22,6 +23,10 @@ from backend.tools.subtitle_detect import auto_detect_subtitle_area, detect_subt
 from backend.tools.subtitle_remover_remote_call import SubtitleRemoverRemoteCall
 from backend.tools.process_manager import ProcessManager
 from backend.tools.common_tools import get_readable_path, is_image_file, is_video_file, read_image
+from backend.tools.watermark_tracker import (
+    build_moving_watermark_preprocess_key,
+    preprocess_moving_watermark_to_file,
+)
 
 WATERMARK_INPAINT_MODES = frozenset((
     InpaintMode.FIXED_WATERMARK,
@@ -161,6 +166,7 @@ class HomeInterface(QWidget):
     auto_subtitle_area_signal = Signal(list, float)
     auto_subtitle_area_error_signal = Signal(str)
     auto_subtitle_area_running_signal = Signal(bool)
+    processing_phase_signal = Signal(str, str)
     def __init__(self, parent=None):
         super().__init__(parent=parent)
         self.setObjectName("HomeInterface")
@@ -203,6 +209,19 @@ class HomeInterface(QWidget):
         self._subtitle_interval_errors = {}
         self._video_dimension_cache = {}
         self._video_frame_count_cache = {}
+        self._video_fps_cache = {}
+        self.moving_preprocess_executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="moving-watermark-preprocess",
+        )
+        self._moving_preprocess_lock = threading.Lock()
+        self._moving_preprocess_futures = {}
+        self._moving_preprocess_results = {}
+        self._moving_preprocess_errors = {}
+        self._moving_preprocess_artifacts = set()
+        self._moving_preprocess_generation = 0
+        self._moving_preprocess_cancel_event = threading.Event()
+        self._active_run_mode = None
 
         # 当前正在处理的任务索引
         self.current_processing_task_index = -1
@@ -222,6 +241,7 @@ class HomeInterface(QWidget):
         self.auto_subtitle_area_signal.connect(self.on_auto_subtitle_area_detected)
         self.auto_subtitle_area_error_signal.connect(lambda message: self.append_output(message))
         self.auto_subtitle_area_running_signal.connect(self.set_auto_area_button_running)
+        self.processing_phase_signal.connect(self.on_processing_phase)
         config.inpaintMode.valueChanged.connect(self.on_inpaint_mode_changed)
         self.on_inpaint_mode_changed(config.inpaintMode.value)
 
@@ -524,6 +544,17 @@ class HomeInterface(QWidget):
             self._video_frame_count_cache[path] = frame_count
         return frame_count
 
+    def _get_video_fps(self, path):
+        fps = self._video_fps_cache.get(path)
+        if fps is not None:
+            return fps
+        cap = cv2.VideoCapture(get_readable_path(path))
+        fps = float(cap.get(cv2.CAP_PROP_FPS)) if cap.isOpened() else 0.0
+        cap.release()
+        if fps > 0:
+            self._video_fps_cache[path] = fps
+        return fps
+
     @staticmethod
     def _normalized_areas_to_video_coordinates(normalized_areas, dimensions):
         if not dimensions:
@@ -810,6 +841,7 @@ class HomeInterface(QWidget):
     def stop_button_clicked(self):
         try:
             self._stop_event.set()
+            self._cancel_moving_preprocessing()
             running_process = self.running_process
             if running_process:
                 self._dispose_subtitle_worker(terminate=True)
@@ -829,6 +861,7 @@ class HomeInterface(QWidget):
         remote_caller.register_log_callback(self.append_log_signal.emit)
         remote_caller.register_update_preview_with_comp_callback(self.update_preview_with_comp_signal.emit)
         remote_caller.register_error_callback(self.task_error_signal.emit)
+        remote_caller.register_processing_phase_callback(self.processing_phase_signal.emit)
 
     def _ensure_subtitle_worker(self):
         if (
@@ -1333,6 +1366,243 @@ class HomeInterface(QWidget):
         ymin, ymax, xmin, xmax = target_areas[0]
         return ymax - ymin >= 8 and xmax - xmin >= 8
 
+    def _begin_moving_preprocess_generation(self, run_mode):
+        with self._moving_preprocess_lock:
+            self._moving_preprocess_cancel_event.set()
+            futures_to_cancel = tuple(self._moving_preprocess_futures.values())
+            self._moving_preprocess_generation += 1
+            self._moving_preprocess_cancel_event = threading.Event()
+            self._moving_preprocess_futures.clear()
+            self._moving_preprocess_results.clear()
+            self._moving_preprocess_errors.clear()
+            self._active_run_mode = run_mode
+        # Future.cancel() invokes done callbacks synchronously for pending work.
+        # Cancel only after publishing the new generation and releasing our lock,
+        # otherwise _done_callback would deadlock trying to acquire the same lock.
+        for future in futures_to_cancel:
+            future.cancel()
+
+    def _cancel_moving_preprocessing(self):
+        with self._moving_preprocess_lock:
+            self._moving_preprocess_cancel_event.set()
+            futures_to_cancel = tuple(self._moving_preprocess_futures.values())
+            self._moving_preprocess_generation += 1
+            self._moving_preprocess_futures.clear()
+            self._moving_preprocess_results.clear()
+            self._moving_preprocess_errors.clear()
+            self._active_run_mode = None
+        for future in futures_to_cancel:
+            future.cancel()
+
+    def _moving_preprocess_request_for_task(self, task_index, task):
+        if not self._is_valid_moving_watermark_task(task_index, task):
+            return None
+        normalized_area, reference_frame_no, template_source_path = (
+            self._moving_watermark_template_for_task(task_index)
+        )
+        template_source_path = template_source_path or task.path
+        dimensions = self._get_video_dimensions(task.path)
+        if not dimensions:
+            return None
+        width, height = dimensions
+        frame_count = self._get_video_frame_count(task.path)
+        fps = self._get_video_fps(task.path)
+        target_areas = self._normalized_areas_to_video_coordinates(
+            [normalized_area],
+            dimensions,
+        )
+        if frame_count <= 0 or fps <= 0 or len(target_areas) != 1:
+            return None
+        ab_sections = task.options.get(TaskOptions.AB_SECTIONS.value, [])
+        artifact_key = build_moving_watermark_preprocess_key(
+            task.path,
+            template_source_path,
+            reference_frame_no,
+            normalized_area,
+            (height, width),
+            frame_count,
+            fps,
+            ab_sections,
+            target_areas[0],
+        )
+        cache_directory = os.path.join(
+            tempfile.gettempdir(),
+            "vsr-moving-watermark-preprocess",
+        )
+        artifact_path = os.path.join(cache_directory, f"{artifact_key}.npz")
+        return {
+            "key": artifact_key,
+            "path": artifact_path,
+            "video_path": task.path,
+            "template_source_path": template_source_path,
+            "reference_frame_no": reference_frame_no,
+            "template_area": normalized_area,
+            "frame_shape": (height, width),
+            "frame_count": frame_count,
+            "fps": fps,
+            "ab_sections": ab_sections,
+            "fallback_target_area": target_areas[0],
+        }
+
+    def _next_pending_task_for_preprocess(self, current_index):
+        current_task = self.task_list_component.get_task(current_index)
+        candidates = [
+            (index, task)
+            for index, task in self.task_list_component.get_pending_tasks()
+            if index != current_index
+        ]
+        if not candidates:
+            return None
+        if current_task is not None:
+            same_batch = [
+                item for item in candidates
+                if item[1].batch_id == current_task.batch_id
+            ]
+            if same_batch:
+                return same_batch[0]
+        return candidates[0]
+
+    def _schedule_next_moving_watermark_preprocess(self, current_index):
+        next_task_item = self._next_pending_task_for_preprocess(current_index)
+        if next_task_item is None:
+            return
+        next_index, next_task = next_task_item
+        request = self._moving_preprocess_request_for_task(next_index, next_task)
+        if request is None:
+            return
+        artifact_key = request["key"]
+        with self._moving_preprocess_lock:
+            if self._active_run_mode != InpaintMode.MOVING_WATERMARK:
+                return
+            if (
+                artifact_key in self._moving_preprocess_results
+                or artifact_key in self._moving_preprocess_futures
+            ):
+                return
+            generation = self._moving_preprocess_generation
+            cancel_event = self._moving_preprocess_cancel_event
+            self._moving_preprocess_errors.pop(artifact_key, None)
+            kwargs = {
+                key: value
+                for key, value in request.items()
+                if key not in ("key", "path")
+            }
+            kwargs["cancel_event"] = cancel_event
+            future = self.moving_preprocess_executor.submit(
+                preprocess_moving_watermark_to_file,
+                request["path"],
+                **kwargs,
+            )
+            self._moving_preprocess_futures[artifact_key] = future
+            self._moving_preprocess_artifacts.add(request["path"])
+
+        self.append_log_signal.emit([
+            tr['Main']['MovingWatermarkPreprocessScheduled'].format(
+                os.path.basename(next_task.path)
+            )
+        ])
+
+        def _done_callback(done_future):
+            try:
+                result = done_future.result()
+            except Exception as error:
+                with self._moving_preprocess_lock:
+                    if generation != self._moving_preprocess_generation:
+                        return
+                    if self._moving_preprocess_futures.get(artifact_key) is not done_future:
+                        return
+                    self._moving_preprocess_errors[artifact_key] = str(error)
+                    self._moving_preprocess_futures.pop(artifact_key, None)
+                if not cancel_event.is_set():
+                    self.append_log_signal.emit([
+                        tr['Main']['MovingWatermarkPreprocessFailed'].format(
+                            os.path.basename(next_task.path),
+                            error,
+                        )
+                    ])
+                return
+            with self._moving_preprocess_lock:
+                if generation != self._moving_preprocess_generation or cancel_event.is_set():
+                    return
+                if self._moving_preprocess_futures.get(artifact_key) is not done_future:
+                    return
+                self._moving_preprocess_results[artifact_key] = result
+                self._moving_preprocess_futures.pop(artifact_key, None)
+                self._moving_preprocess_errors.pop(artifact_key, None)
+            self.append_log_signal.emit([
+                tr['Main']['MovingWatermarkPreprocessReady'].format(
+                    os.path.basename(next_task.path),
+                    result["elapsed"],
+                )
+            ])
+
+        future.add_done_callback(_done_callback)
+
+    def _take_moving_watermark_preprocess(self, task_index, task):
+        request = self._moving_preprocess_request_for_task(task_index, task)
+        if request is None:
+            return None
+        artifact_key = request["key"]
+        with self._moving_preprocess_lock:
+            result = self._moving_preprocess_results.get(artifact_key)
+            future = self._moving_preprocess_futures.get(artifact_key)
+            error = self._moving_preprocess_errors.get(artifact_key)
+            generation = self._moving_preprocess_generation
+            cancel_event = self._moving_preprocess_cancel_event
+        if result is None and future is not None:
+            if not future.done():
+                self.append_log_signal.emit([
+                    tr['Main']['MovingWatermarkPreprocessWaiting'].format(
+                        os.path.basename(task.path)
+                    )
+                ])
+            while result is None and not self._stop_event.is_set() and not cancel_event.is_set():
+                try:
+                    result = future.result(timeout=0.2)
+                except FutureTimeoutError:
+                    continue
+                except Exception as future_error:
+                    error = str(future_error)
+                    break
+        if result is None:
+            if error and not cancel_event.is_set():
+                self.append_log_signal.emit([
+                    tr['Main']['MovingWatermarkPreprocessFailed'].format(
+                        os.path.basename(task.path),
+                        error,
+                    )
+                ])
+            return None
+        with self._moving_preprocess_lock:
+            if generation != self._moving_preprocess_generation:
+                return None
+            self._moving_preprocess_results.pop(artifact_key, None)
+            self._moving_preprocess_futures.pop(artifact_key, None)
+            self._moving_preprocess_errors.pop(artifact_key, None)
+        if result.get("key") != artifact_key or not os.path.isfile(result.get("path", "")):
+            return None
+        self.append_log_signal.emit([
+            tr['Main']['MovingWatermarkPreprocessConsumed'].format(
+                os.path.basename(task.path)
+            )
+        ])
+        return result
+
+    @Slot(str, str)
+    def on_processing_phase(self, phase, video_path):
+        if (
+            phase != "inpaint_started"
+            or not self._is_processing
+            or self._active_run_mode != InpaintMode.MOVING_WATERMARK
+            or not config.hardwareAcceleration.value
+        ):
+            return
+        current_index = self.current_processing_task_index
+        current_task = self.task_list_component.get_task(current_index)
+        if current_task is None or os.path.abspath(current_task.path) != os.path.abspath(video_path):
+            return
+        self._schedule_next_moving_watermark_preprocess(current_index)
+
     def run_button_clicked(self):
         run_mode = config.inpaintMode.value
         pending_tasks = self.task_list_component.get_pending_tasks()
@@ -1369,6 +1639,7 @@ class HomeInterface(QWidget):
                 return
 
             self._stop_event.clear()
+            self._begin_moving_preprocess_generation(run_mode)
             self._is_processing = True
             self.setting_interface.set_inpaint_mode_enabled(False)
             self.toggle_buttons_signal.emit(False)
@@ -1497,6 +1768,12 @@ class HomeInterface(QWidget):
                                 options["tracking_reference_frame_no"] = tracking_reference_frame_no
                                 options["tracking_template_area"] = tracking_template_area
                                 options["tracking_template_source_path"] = tracking_template_source_path
+                                preprocess_result = self._take_moving_watermark_preprocess(
+                                    self.current_processing_task_index,
+                                    task_item,
+                                )
+                                if preprocess_result is not None:
+                                    options["moving_watermark_preprocess_path"] = preprocess_result["path"]
                             if subtitle_intervals is not None:
                                 options[TaskOptions.SUBTITLE_INTERVALS.value] = subtitle_intervals
                             options["inpaint_mode"] = run_mode
@@ -1560,6 +1837,7 @@ class HomeInterface(QWidget):
                                     self.video_cap.release()
                                     self.video_cap = None
                 finally:
+                    self._cancel_moving_preprocessing()
                     if config.inpaintMode.value != run_mode:
                         config.set(config.inpaintMode, run_mode)
                     self._saved_inpaint_mode = None
@@ -1568,6 +1846,7 @@ class HomeInterface(QWidget):
             self._worker_thread = threading.Thread(target=task, daemon=True)
             self._worker_thread.start()
         except Exception as e:
+            self._cancel_moving_preprocessing()
             self._is_processing = False
             self.setting_interface.set_inpaint_mode_enabled(self._saved_inpaint_mode is None)
             print(traceback.format_exc())
@@ -1599,6 +1878,11 @@ class HomeInterface(QWidget):
             sr.append_output = lambda *args: SubtitleRemoverRemoteCall.remote_call_append_log(queue, args)
             sr.manage_process = lambda pid: SubtitleRemoverRemoteCall.remote_call_manage_process(queue, pid)
             sr.update_preview_with_comp = lambda *args: SubtitleRemoverRemoteCall.remote_call_update_preview_with_comp(queue, args)
+            sr.report_processing_phase = lambda phase, path: SubtitleRemoverRemoteCall.remote_call_processing_phase(
+                queue,
+                phase,
+                path,
+            )
             sr.run()
         except Exception as e:
             traceback.print_exc()
@@ -1979,6 +2263,7 @@ class HomeInterface(QWidget):
         try:
             # 通知 worker 线程停止
             self._stop_event.set()
+            self._cancel_moving_preprocessing()
             # 终止子进程
             self._dispose_subtitle_worker(terminate=False)
             ProcessManager.instance().terminate_all()
@@ -1992,10 +2277,18 @@ class HomeInterface(QWidget):
             self.update_preview_with_comp_signal.disconnect(self.update_preview_with_comp)
             self.task_error_signal.disconnect(self.on_task_error)
             self.toggle_buttons_signal.disconnect(self._toggle_buttons)
+            self.processing_phase_signal.disconnect(self.on_processing_phase)
             self.video_display_component.video_slider.valueChanged.disconnect(self.slider_changed)
             self.video_display_component.ab_sections_changed.disconnect(self.ab_sections_changed)
             self.video_display_component.selections_changed.disconnect(self.selections_changed)
             self.auto_area_executor.shutdown(wait=False, cancel_futures=False)
+            self.moving_preprocess_executor.shutdown(wait=False, cancel_futures=True)
+            for artifact_path in list(self._moving_preprocess_artifacts):
+                try:
+                    if os.path.isfile(artifact_path):
+                        os.remove(artifact_path)
+                except OSError:
+                    pass
             # 释放视频资源
             with self._video_cap_lock:
                 if self.video_cap:
