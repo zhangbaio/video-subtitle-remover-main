@@ -11,6 +11,7 @@ class InpaintMode(Enum):
     PROPAINTER = "propainter"
     OPENCV = "opencv"
     FIXED_WATERMARK = "fixed-watermark"
+    MOVING_WATERMARK = "moving-watermark"
 
 @unique
 class SubtitleDetectMode(Enum):

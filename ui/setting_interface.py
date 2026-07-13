@@ -71,6 +71,15 @@ class SettingInterface(QtWidgets.QVBoxLayout):
             self.hardware_acceleration.switchButton.setEnabled(False)
             self.hardware_acceleration.setContent(tr["Setting"]["HardwareAccelerationNO"])
             config.set(config.hardwareAcceleration, False)
+
+        self.moving_watermark_fast_mode = SwitchSettingCard(
+            configItem=config.movingWatermarkFastMode,
+            icon=FluentIcon.SPEED_HIGH,
+            title=tr["Setting"]["MovingWatermarkFastMode"],
+            content=tr["Setting"]["MovingWatermarkFastModeDesc"],
+            parent=parent,
+        )
+        self.addWidget(self.moving_watermark_fast_mode)
         # 添加一些空间
         self.addStretch(1)
     

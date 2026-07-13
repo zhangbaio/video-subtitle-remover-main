@@ -51,6 +51,7 @@ class Config(QConfig):
     - InpaintMode.LAMA 算法：对于动画类视频效果好，速度一般，不可以跳过字幕检测
     - InpaintMode.PROPAINTER 算法： 需要消耗大量显存，速度较慢，对运动非常剧烈的视频效果较好
     - InpaintMode.FIXED_WATERMARK 固定水印：手工选区作为真实遮罩，ProPainter全帧修复
+    - InpaintMode.MOVING_WATERMARK 移动水印：模板跟踪生成逐帧动态遮罩
     """
     # 【设置inpaint算法】
     inpaintMode = OptionsConfigItem("Main", "InpaintMode", InpaintMode.STTN_AUTO, OptionsValidator(InpaintMode), EnumSerializer(InpaintMode))
@@ -101,6 +102,12 @@ class Config(QConfig):
     # 1280x720p视频设置80需要25G显存，设置50需要19G显存
     # 720x480p视频设置80需要8G显存，设置50需要7G显存
     propainterMaxLoadNum = RangeConfigItem("ProPainter", "MaxLoadNum", 70, RangeValidator(1, 300))
+    movingWatermarkFastMode = ConfigItem(
+        "ProPainter",
+        "MovingWatermarkFastMode",
+        True,
+        BoolValidator(),
+    )
 
     # 是否使用硬件加速
     hardwareAcceleration = ConfigItem("Main", "HardwareAcceleration", HARDWARD_ACCELERATION_OPTION, BoolValidator())

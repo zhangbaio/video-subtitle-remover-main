@@ -23,6 +23,12 @@ from backend.tools.subtitle_remover_remote_call import SubtitleRemoverRemoteCall
 from backend.tools.process_manager import ProcessManager
 from backend.tools.common_tools import get_readable_path, is_image_file, is_video_file, read_image
 
+WATERMARK_INPAINT_MODES = frozenset((
+    InpaintMode.FIXED_WATERMARK,
+    InpaintMode.MOVING_WATERMARK,
+))
+
+
 class BatchFolderManagerDialog(QtWidgets.QDialog):
     def __init__(self, parent=None, default_output_root=""):
         super().__init__(parent)
@@ -165,6 +171,7 @@ class HomeInterface(QWidget):
         self.frame_count = None
         self.frame_width = None
         self.frame_height = None
+        self._displayed_frame_no = 0
         self.se = None  # 后台字幕提取器
 
         # 字幕区域参数
@@ -195,6 +202,7 @@ class HomeInterface(QWidget):
         self._subtitle_interval_results = {}
         self._subtitle_interval_errors = {}
         self._video_dimension_cache = {}
+        self._video_frame_count_cache = {}
 
         # 当前正在处理的任务索引
         self.current_processing_task_index = -1
@@ -335,14 +343,41 @@ class HomeInterface(QWidget):
         frame = None
         with self._video_cap_lock:
             if self.video_cap is not None and self.video_cap.isOpened():
-                frame_no = self.video_slider.value()
+                frame_no = int(value)
                 self.video_cap.set(cv2.CAP_PROP_POS_FRAMES, frame_no)
                 ret, frame = self.video_cap.read()
                 if not ret:
                     frame = None
+                else:
+                    self._displayed_frame_no = max(
+                        0,
+                        int(round(self.video_cap.get(cv2.CAP_PROP_POS_FRAMES))) - 1,
+                    )
         if frame is not None:
             # 更新预览图像
             self.update_preview(frame)
+
+    def _seek_preview_to_frame(self, frame_no):
+        """Decode and display an exact zero-based reference frame."""
+        try:
+            frame_no = int(frame_no)
+        except (TypeError, ValueError):
+            return False
+        if frame_no < 0 or not self.frame_count or frame_no >= self.frame_count:
+            return False
+        self.video_slider.blockSignals(True)
+        try:
+            self.video_slider.setValue(
+                max(self.video_slider.minimum(), min(frame_no, self.video_slider.maximum()))
+            )
+        finally:
+            self.video_slider.blockSignals(False)
+        self.slider_changed(frame_no)
+        return self._displayed_frame_no == frame_no
+
+    @staticmethod
+    def _is_watermark_mode(mode=None):
+        return (mode or config.inpaintMode.value) in WATERMARK_INPAINT_MODES
 
     def ab_sections_changed(self, ab_sections):
         if self._is_processing:
@@ -372,6 +407,51 @@ class HomeInterface(QWidget):
             if self._selection_change_source is None:
                 self._save_fixed_watermark_areas(normalized_areas)
                 self._propagate_fixed_watermark_areas(get_current_task_index, normalized_areas)
+            return
+
+        if config.inpaintMode.value == InpaintMode.MOVING_WATERMARK:
+            # The tracking MVP intentionally uses one tight template. Keep the
+            # most recently created/active selection if the generic selector
+            # contains more than one rectangle.
+            selections = list(selections[-1:]) if selections else []
+            if selections != self.video_display_component.get_selection_rects():
+                self.video_display_component.set_selection_rects(selections)
+            # Loading an existing task/template also emits selectionsChanged.
+            # It is display-only: keep the template source and reference frame
+            # captured from the original batch video instead of overwriting
+            # them with the task that has just been selected.
+            if self._selection_change_source is not None:
+                return
+            normalized_areas = self._sanitize_normalized_areas(
+                self.video_display_component.preview_coordinates_to_normalized_video_coordinates(
+                    selections
+                )
+            )
+            normalized_area = normalized_areas[-1] if normalized_areas else None
+            reference_frame_no = self._displayed_frame_no if normalized_area else None
+            template_source_path = self.video_path if normalized_area else None
+            self.task_list_component.update_task_option(
+                get_current_task_index,
+                TaskOptions.MOVING_WATERMARK_TEMPLATE_AREA,
+                normalized_area,
+            )
+            self.task_list_component.update_task_option(
+                get_current_task_index,
+                TaskOptions.MOVING_WATERMARK_REFERENCE_FRAME_NO,
+                reference_frame_no,
+            )
+            self.task_list_component.update_task_option(
+                get_current_task_index,
+                TaskOptions.MOVING_WATERMARK_TEMPLATE_SOURCE_PATH,
+                template_source_path,
+            )
+            if self._selection_change_source is None:
+                self._propagate_moving_watermark_template(
+                    get_current_task_index,
+                    normalized_area,
+                    reference_frame_no,
+                    template_source_path,
+                )
             return
 
         self.task_list_component.update_task_option(get_current_task_index, TaskOptions.SUB_AREAS, selections)
@@ -433,6 +513,17 @@ class HomeInterface(QWidget):
             return dimensions
         return None
 
+    def _get_video_frame_count(self, path):
+        frame_count = self._video_frame_count_cache.get(path)
+        if frame_count is not None:
+            return frame_count
+        cap = cv2.VideoCapture(get_readable_path(path))
+        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) if cap.isOpened() else 0
+        cap.release()
+        if frame_count > 0:
+            self._video_frame_count_cache[path] = frame_count
+        return frame_count
+
     @staticmethod
     def _normalized_areas_to_video_coordinates(normalized_areas, dimensions):
         if not dimensions:
@@ -476,6 +567,92 @@ class HomeInterface(QWidget):
                 list(normalized_areas),
             )
 
+    def _propagate_moving_watermark_template(
+        self,
+        task_index,
+        normalized_area,
+        reference_frame_no,
+        template_source_path,
+    ):
+        """Share one captured tracking template with pending tasks in the batch."""
+        task = self.task_list_component.get_task(task_index)
+        if task is None:
+            return
+        normalized = self._sanitize_normalized_areas(
+            [normalized_area] if normalized_area is not None else []
+        )
+        normalized_area = normalized[0] if len(normalized) == 1 else None
+        if normalized_area is None:
+            reference_frame_no = None
+            template_source_path = None
+        target_dimensions = self._get_video_dimensions(task.path)
+        target_ratio = (
+            target_dimensions[0] / target_dimensions[1]
+            if target_dimensions and target_dimensions[1]
+            else None
+        )
+        for pending_index, pending_task in self.task_list_component.get_pending_tasks_by_batch(task.batch_id):
+            if normalized_area is not None and target_ratio and pending_task.path != task.path:
+                dimensions = self._get_video_dimensions(pending_task.path)
+                if not dimensions or not dimensions[1]:
+                    continue
+                ratio = dimensions[0] / dimensions[1]
+                if abs(ratio - target_ratio) / target_ratio > 0.01:
+                    continue
+            self.task_list_component.update_task_option(
+                pending_index,
+                TaskOptions.MOVING_WATERMARK_TEMPLATE_AREA,
+                normalized_area,
+            )
+            self.task_list_component.update_task_option(
+                pending_index,
+                TaskOptions.MOVING_WATERMARK_REFERENCE_FRAME_NO,
+                reference_frame_no,
+            )
+            self.task_list_component.update_task_option(
+                pending_index,
+                TaskOptions.MOVING_WATERMARK_TEMPLATE_SOURCE_PATH,
+                template_source_path,
+            )
+
+    def _moving_watermark_template_for_task(self, task_index):
+        area = self.task_list_component.get_task_option(
+            task_index,
+            TaskOptions.MOVING_WATERMARK_TEMPLATE_AREA,
+            None,
+        )
+        normalized = self._sanitize_normalized_areas([area] if area is not None else [])
+        reference_frame_no = self.task_list_component.get_task_option(
+            task_index,
+            TaskOptions.MOVING_WATERMARK_REFERENCE_FRAME_NO,
+            None,
+        )
+        if isinstance(reference_frame_no, bool):
+            reference_frame_no = None
+        else:
+            try:
+                numeric_frame_no = float(reference_frame_no)
+                parsed_frame_no = int(numeric_frame_no)
+                reference_frame_no = (
+                    parsed_frame_no if numeric_frame_no == parsed_frame_no else None
+                )
+            except (TypeError, ValueError, OverflowError):
+                reference_frame_no = None
+        template_source_path = self.task_list_component.get_task_option(
+            task_index,
+            TaskOptions.MOVING_WATERMARK_TEMPLATE_SOURCE_PATH,
+            None,
+        )
+        try:
+            template_source_path = os.fspath(template_source_path) if template_source_path else None
+        except TypeError:
+            template_source_path = None
+        return (
+            normalized[0] if len(normalized) == 1 else None,
+            reference_frame_no,
+            template_source_path,
+        )
+
     def on_task_selected(self, index, file_path):
         """处理任务被选中事件
         
@@ -515,6 +692,26 @@ class HomeInterface(QWidget):
                         normalized_areas
                     )
                 )
+            finally:
+                self._selection_change_source = None
+            return
+        if config.inpaintMode.value == InpaintMode.MOVING_WATERMARK:
+            normalized_area, reference_frame_no, template_source_path = (
+                self._moving_watermark_template_for_task(index)
+            )
+            if (
+                normalized_area is not None
+                and template_source_path
+                and os.path.abspath(template_source_path) == os.path.abspath(file_path)
+                and reference_frame_no is not None
+            ):
+                self._seek_preview_to_frame(reference_frame_no)
+            self._selection_change_source = "moving_template"
+            try:
+                preview_areas = self.video_display_component.normalized_video_coordinates_to_preview_coordinates(
+                    [normalized_area] if normalized_area is not None else []
+                )
+                self.video_display_component.set_selection_rects(preview_areas)
             finally:
                 self._selection_change_source = None
             return
@@ -701,7 +898,7 @@ class HomeInterface(QWidget):
         self.auto_area_button.setEnabled(
             show_run
             and not self._auto_area_button_running
-            and config.inpaintMode.value != InpaintMode.FIXED_WATERMARK
+            and not self._is_watermark_mode()
         )
         self.setting_interface.set_inpaint_mode_enabled(
             show_run and self._saved_inpaint_mode is None
@@ -710,16 +907,18 @@ class HomeInterface(QWidget):
     @Slot(bool)
     def set_auto_area_button_running(self, running):
         self._auto_area_button_running = running
-        fixed_watermark_mode = config.inpaintMode.value == InpaintMode.FIXED_WATERMARK
-        self.auto_area_button.setEnabled(not running and not fixed_watermark_mode)
+        watermark_mode = self._is_watermark_mode()
+        self.auto_area_button.setEnabled(not running and not watermark_mode)
         self.auto_area_button.setText("识别中..." if running else "自动框选")
 
     @Slot(object)
     def on_inpaint_mode_changed(self, mode):
         fixed_watermark_mode = mode == InpaintMode.FIXED_WATERMARK
-        self.setting_interface.set_subtitle_controls_enabled(not fixed_watermark_mode)
+        moving_watermark_mode = mode == InpaintMode.MOVING_WATERMARK
+        watermark_mode = self._is_watermark_mode(mode)
+        self.setting_interface.set_subtitle_controls_enabled(not watermark_mode)
         self.auto_area_button.setEnabled(
-            not self._auto_area_button_running and not fixed_watermark_mode
+            not self._auto_area_button_running and not watermark_mode
         )
         task_index = self.task_list_component.get_current_task_index()
         if task_index < 0:
@@ -750,6 +949,30 @@ class HomeInterface(QWidget):
             )
             return
 
+        if moving_watermark_mode:
+            normalized_area, reference_frame_no, template_source_path = (
+                self._moving_watermark_template_for_task(task_index)
+            )
+            task = self.task_list_component.get_task(task_index)
+            if (
+                task is not None
+                and normalized_area is not None
+                and template_source_path
+                and os.path.abspath(template_source_path) == os.path.abspath(task.path)
+                and reference_frame_no is not None
+            ):
+                self._seek_preview_to_frame(reference_frame_no)
+            self._selection_change_source = "moving_template"
+            try:
+                self.video_display_component.set_selection_rects(
+                    self.video_display_component.normalized_video_coordinates_to_preview_coordinates(
+                        [normalized_area] if normalized_area is not None else []
+                    )
+                )
+            finally:
+                self._selection_change_source = None
+            return
+
         subtitle_areas = self.task_list_component.get_task_option(
             task_index, TaskOptions.SUB_AREAS, []
         )
@@ -763,7 +986,7 @@ class HomeInterface(QWidget):
             self._selection_change_source = None
 
     def _task_needs_auto_area(self, task_index, video_path):
-        if config.inpaintMode.value == InpaintMode.FIXED_WATERMARK:
+        if self._is_watermark_mode():
             return False
         subtitle_areas = self.task_list_component.get_task_option(task_index, TaskOptions.SUB_AREAS, [])
         subtitle_areas_source = self.task_list_component.get_task_option(task_index, TaskOptions.SUB_AREAS_SOURCE, "")
@@ -902,8 +1125,13 @@ class HomeInterface(QWidget):
         if not self.video_path:
             self.append_output(tr['SubtitleExtractorGUI']['OpenVideoFirst'])
             return
-        if config.inpaintMode.value == InpaintMode.FIXED_WATERMARK:
-            self.append_output(tr['Main']['FixedWatermarkAreaRequired'])
+        if self._is_watermark_mode():
+            message_key = (
+                'MovingWatermarkTemplateRequired'
+                if config.inpaintMode.value == InpaintMode.MOVING_WATERMARK
+                else 'FixedWatermarkAreaRequired'
+            )
+            self.append_output(tr['Main'][message_key])
             return
 
         current_task_index = self.task_list_component.get_current_task_index()
@@ -933,7 +1161,7 @@ class HomeInterface(QWidget):
 
     @Slot(list, float)
     def on_auto_subtitle_area_detected(self, areas, confidence):
-        if config.inpaintMode.value == InpaintMode.FIXED_WATERMARK:
+        if self._is_watermark_mode():
             return
         if not areas:
             self.append_output("自动框选失败: 未找到可用字幕区域")
@@ -976,6 +1204,18 @@ class HomeInterface(QWidget):
             )
             if not preview_areas:
                 raise ValueError(tr['Main']['FixedWatermarkAreaRequired'])
+            return preview_areas
+        if inpaint_mode == InpaintMode.MOVING_WATERMARK:
+            normalized_area, reference_frame_no, _ = self._moving_watermark_template_for_task(
+                task_index
+            )
+            if normalized_area is None or reference_frame_no is None:
+                raise ValueError(tr['Main']['MovingWatermarkTemplateRequired'])
+            preview_areas = self.video_display_component.normalized_video_coordinates_to_preview_coordinates(
+                [normalized_area]
+            )
+            if len(preview_areas) != 1:
+                raise ValueError(tr['Main']['MovingWatermarkTemplateRequired'])
             return preview_areas
         should_auto_detect = self._task_needs_auto_area(task_index, video_path)
         if subtitle_areas and len(subtitle_areas) > 0 and not should_auto_detect:
@@ -1061,6 +1301,38 @@ class HomeInterface(QWidget):
             self.task_list_component.update_task_option(task_index, TaskOptions.SUBTITLE_INTERVALS, [])
             return []
 
+    def _is_valid_moving_watermark_task(self, task_index, task):
+        if task is None or not is_video_file(task.path) or is_image_file(task.path):
+            return False
+        normalized_area, reference_frame_no, template_source_path = (
+            self._moving_watermark_template_for_task(task_index)
+        )
+        if normalized_area is None or reference_frame_no is None:
+            return False
+        template_source_path = template_source_path or task.path
+        if not os.path.isfile(template_source_path) or not is_video_file(template_source_path):
+            return False
+        source_frame_count = self._get_video_frame_count(template_source_path)
+        if not 0 <= reference_frame_no < source_frame_count:
+            return False
+        source_areas = self._normalized_areas_to_video_coordinates(
+            [normalized_area],
+            self._get_video_dimensions(template_source_path),
+        )
+        if len(source_areas) != 1:
+            return False
+        ymin, ymax, xmin, xmax = source_areas[0]
+        if ymax - ymin < 8 or xmax - xmin < 8:
+            return False
+        target_areas = self._normalized_areas_to_video_coordinates(
+            [normalized_area],
+            self._get_video_dimensions(task.path),
+        )
+        if len(target_areas) != 1:
+            return False
+        ymin, ymax, xmin, xmax = target_areas[0]
+        return ymax - ymin >= 8 and xmax - xmin >= 8
+
     def run_button_clicked(self):
         run_mode = config.inpaintMode.value
         pending_tasks = self.task_list_component.get_pending_tasks()
@@ -1079,6 +1351,16 @@ class HomeInterface(QWidget):
                 self.task_list_component.select_task(missing_selection[0][0])
                 self.append_output(tr['Main']['FixedWatermarkAreaRequired'])
                 return
+        if run_mode == InpaintMode.MOVING_WATERMARK:
+            invalid_template = [
+                (index, task)
+                for index, task in pending_tasks
+                if not self._is_valid_moving_watermark_task(index, task)
+            ]
+            if invalid_template:
+                self.task_list_component.select_task(invalid_template[0][0])
+                self.append_output(tr['Main']['MovingWatermarkTemplateRequired'])
+                return
 
         try:
             # 获取所有待执行的任务
@@ -1095,7 +1377,7 @@ class HomeInterface(QWidget):
                 try:
                     self.append_log_signal.emit(["初始化处理引擎..."])
                     self._ensure_subtitle_worker()
-                    if run_mode != InpaintMode.FIXED_WATERMARK:
+                    if not self._is_watermark_mode(run_mode):
                         self._schedule_pending_auto_area_detections()
                         self._schedule_pending_subtitle_interval_detections()
                     while not self._stop_event.is_set():
@@ -1103,7 +1385,7 @@ class HomeInterface(QWidget):
                             pending_tasks = self.task_list_component.get_pending_tasks()
                             if not pending_tasks:
                                 break
-                            if run_mode != InpaintMode.FIXED_WATERMARK:
+                            if not self._is_watermark_mode(run_mode):
                                 self._schedule_pending_auto_area_detections()
                                 self._schedule_pending_subtitle_interval_detections()
                             current_batch_id = pending_tasks[0][1].batch_id
@@ -1129,7 +1411,11 @@ class HomeInterface(QWidget):
                                 )
                                 continue
 
-                            # 固定水印使用视频归一化坐标，避免依赖运行中的预览窗口状态
+                            tracking_reference_frame_no = None
+                            tracking_template_area = None
+                            tracking_template_source_path = None
+                            # Watermark modes use normalized video coordinates and
+                            # do not depend on mutable preview-widget geometry.
                             if run_mode == InpaintMode.FIXED_WATERMARK:
                                 normalized_areas = task_item.options.get(
                                     TaskOptions.FIXED_WATERMARK_AREAS.value, []
@@ -1140,6 +1426,26 @@ class HomeInterface(QWidget):
                                 )
                                 if not subtitle_areas_video:
                                     raise ValueError(tr['Main']['FixedWatermarkAreaRequired'])
+                            elif run_mode == InpaintMode.MOVING_WATERMARK:
+                                (
+                                    tracking_template_area,
+                                    tracking_reference_frame_no,
+                                    tracking_template_source_path,
+                                ) = self._moving_watermark_template_for_task(
+                                    self.current_processing_task_index
+                                )
+                                subtitle_areas_video = self._normalized_areas_to_video_coordinates(
+                                    [tracking_template_area] if tracking_template_area is not None else [],
+                                    self._get_video_dimensions(task_item.path),
+                                )
+                                if (
+                                    len(subtitle_areas_video) != 1
+                                    or tracking_reference_frame_no is None
+                                ):
+                                    raise ValueError(tr['Main']['MovingWatermarkTemplateRequired'])
+                                tracking_template_source_path = (
+                                    tracking_template_source_path or task_item.path
+                                )
                             else:
                                 subtitle_areas = self.ensure_subtitle_areas_before_run(
                                     self.current_processing_task_index,
@@ -1154,7 +1460,7 @@ class HomeInterface(QWidget):
                                 run_mode,
                             )
 
-                            if run_mode != InpaintMode.FIXED_WATERMARK:
+                            if not self._is_watermark_mode(run_mode):
                                 self.video_display_component.save_selections_to_config()
 
                             # 更新任务状态为运行中
@@ -1175,15 +1481,22 @@ class HomeInterface(QWidget):
                                     TaskOptions.SUB_AREAS_SOURCE.value,
                                     TaskOptions.SUB_AREAS.value,
                                     TaskOptions.FIXED_WATERMARK_AREAS.value,
+                                    TaskOptions.MOVING_WATERMARK_TEMPLATE_AREA.value,
+                                    TaskOptions.MOVING_WATERMARK_REFERENCE_FRAME_NO.value,
+                                    TaskOptions.MOVING_WATERMARK_TEMPLATE_SOURCE_PATH.value,
                                 ):
                                     continue
                                 if (
-                                    run_mode == InpaintMode.FIXED_WATERMARK
+                                    self._is_watermark_mode(run_mode)
                                     and key == TaskOptions.SUBTITLE_INTERVALS.value
                                 ):
                                     continue
                                 options[key] = task_item.options[key]
                             options[TaskOptions.SUB_AREAS.value] = subtitle_areas_video
+                            if run_mode == InpaintMode.MOVING_WATERMARK:
+                                options["tracking_reference_frame_no"] = tracking_reference_frame_no
+                                options["tracking_template_area"] = tracking_template_area
+                                options["tracking_template_source_path"] = tracking_template_source_path
                             if subtitle_intervals is not None:
                                 options[TaskOptions.SUBTITLE_INTERVALS.value] = subtitle_intervals
                             options["inpaint_mode"] = run_mode
@@ -1463,10 +1776,12 @@ class HomeInterface(QWidget):
             self.frame_height = int(self.video_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
             self.frame_width = int(self.video_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
             self.fps = self.video_cap.get(cv2.CAP_PROP_FPS)
+            self._displayed_frame_no = 0
             self._video_dimension_cache[video_path] = (self.frame_width, self.frame_height)
+            self._video_frame_count_cache[video_path] = self.frame_count
 
         self.update_preview(frame)
-        self.video_slider.setMaximum(self.frame_count)
+        self.video_slider.setMaximum(max(1, self.frame_count - 1))
         self.video_slider.setValue(1)
         self.video_display_component.set_dragger_enabled(not self._is_processing)
         # 视频模式下恢复用户原始的 inpaint 模式选择
@@ -1484,7 +1799,9 @@ class HomeInterface(QWidget):
         self.frame_count = 1
         self.frame_height = frame.shape[0]
         self.frame_width = frame.shape[1]
+        self._displayed_frame_no = 0
         self._video_dimension_cache[path] = (self.frame_width, self.frame_height)
+        self._video_frame_count_cache[path] = self.frame_count
         self.fps = 1
         self.update_preview(frame)
         self.video_slider.setMaximum(self.frame_count)

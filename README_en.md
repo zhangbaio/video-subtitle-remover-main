@@ -21,7 +21,9 @@ It mainly implements the following functionalities:
 - Supports custom subtitle positions by only removing subtitles in the defined location (input position)
 - Supports automatic removal of all text throughout the entire video (without inputting a position)
 - Supports multi-selection of images for batch removal of watermark text
-- Supports fixed-watermark removal: manually select a logo/overlay and inpaint every frame with a real ProPainter mask, without OCR
+- Supports fixed-watermark removal: tightly select a stationary logo/overlay and inpaint it with a real ProPainter mask, without OCR
+- Supports automatic moving-watermark tracking: seek to a clear reference frame and select one watermark; the app tracks moving or corner-switching positions throughout the video and leaves low-confidence/no-watermark frames untouched
+- Fast moving-watermark mode is enabled by default to reduce optical-flow work and dynamic-mask memory for compact logos; turn it off when maximum quality matters more than speed
 
 ![demo.png](https://github.com/YaoFANGUK/video-subtitle-remover/raw/main/design/demo.png)
 
@@ -77,7 +79,7 @@ options:
                         Output video file path (optional)
   --subtitle-area-coords YMIN YMAX XMIN XMAX, -c YMIN YMAX XMIN XMAX
                         Subtitle area coordinates (ymin ymax xmin xmax). Can be specified multiple times for multiple areas.
-  --inpaint-mode {sttn-auto,sttn-det,lama,propainter,opencv,fixed-watermark}
+  --inpaint-mode {sttn-auto,sttn-det,lama,propainter,opencv,fixed-watermark,moving-watermark}
                         Inpaint mode, default is sttn-auto
 ```
 ## Demonstration

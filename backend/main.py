@@ -21,6 +21,7 @@ from backend.inpaint.lama_inpaint import LamaInpaint
 from backend.inpaint.opencv_inpaint import OpenCVInpaint
 from backend.inpaint.propainter_inpaint import PropainterInpaint
 from backend.tools.inpaint_tools import (
+    build_fixed_watermark_masks,
     create_mask,
     batch_generator,
     expand_frame_ranges,
@@ -30,6 +31,12 @@ from backend.tools.model_config import ModelConfig
 from backend.tools.ffmpeg_cli import FFmpegCLI
 from backend.tools.subtitle_detect import SubtitleDetect
 from backend.tools.video_io import FramePrefetcher, FFmpegVideoWriter, create_processing_capture
+from backend.tools.watermark_tracker import (
+    MovingWatermarkTracker,
+    read_video_frame,
+    refine_watermark_area,
+    smooth_tracking_results,
+)
 import tempfile
 import multiprocessing
 import time
@@ -40,6 +47,7 @@ import numpy as np
 _LAMA_INPAINT_CACHE = {}
 _STTN_DET_INPAINT_CACHE = {}
 _PROPAINTER_INPAINT_CACHE = {}
+WATERMARK_INPAINT_MODES = (InpaintMode.FIXED_WATERMARK, InpaintMode.MOVING_WATERMARK)
 
 
 def _device_cache_key(device):
@@ -104,6 +112,9 @@ class SubtitleRemover:
         # inpaint的frame_no区域列表, 默认为inpaint所有帧
         self.ab_sections = None
         self.subtitle_intervals = None
+        self.tracking_reference_frame_no = 0
+        self.tracking_template_area = None
+        self.tracking_template_source_path = None
         self.preview_emit_interval = 0.2 if gui_mode else 0.0
         self._last_preview_emit_time = 0.0
 
@@ -314,19 +325,51 @@ class SubtitleRemover:
                                 self.update_progress(tbar, increment=len(batch))
         reader.release()
 
-    def _create_fixed_watermark_mask(self):
+    def _create_fixed_watermark_mask(self, areas=None):
         """Create a full-frame mask directly from the user-selected regions."""
         mask_area_coordinates = []
-        for sub_area in self.sub_areas:
+        for sub_area in (self.sub_areas if areas is None else areas):
             ymin, ymax, xmin, xmax = sub_area
             mask_area_coordinates.append((xmin, xmax, ymin, ymax))
-        return create_mask(self.mask_size, mask_area_coordinates)
+        # Fixed selections must stay tight. Subtitle masks deliberately add a
+        # 10px deviation, which produces a large rectangular patch for logos.
+        return create_mask(self.mask_size, mask_area_coordinates, deviation=0)
 
-    def _inpaint_fixed_watermark_batch(self, frames, mask):
+    @staticmethod
+    def _fixed_watermark_preview(frame, mask):
+        """Show the selected boundary without covering the source with gray."""
+        preview = frame.copy()
+        contours, _ = cv2.findContours((mask > 0).astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        cv2.drawContours(preview, contours, -1, (0, 255, 0), 2)
+        return preview
+
+    @staticmethod
+    def _blend_fixed_watermark_frame(original, completed, selection_mask):
+        """Keep the selection fully erased and feather only its clean outer ring."""
+        _, outer_mask, alpha = build_fixed_watermark_masks(selection_mask)
+        alpha = alpha[:, :, np.newaxis]
+        blended = completed.astype(np.float32) * alpha + original.astype(np.float32) * (1.0 - alpha)
+        return np.clip(blended, 0, 255).astype(np.uint8), outer_mask
+
+    def _inpaint_fixed_watermark_batch(self, frames, mask, fast=False):
         """Inpaint a contiguous frame batch while handling a one-frame tail."""
         if len(frames) == 1:
-            return [self.lama_inpaint.inpaint(frames[0], mask)]
-        return self.propainter_inpaint_model(frames, mask)
+            frame_mask = mask[0] if isinstance(mask, (list, tuple)) else mask
+            _, outer_mask, _ = build_fixed_watermark_masks(frame_mask)
+            rgb_frame = cv2.cvtColor(frames[0], cv2.COLOR_BGR2RGB)
+            completed_rgb = self.lama_inpaint.inpaint(rgb_frame, outer_mask)
+            completed = cv2.cvtColor(completed_rgb, cv2.COLOR_RGB2BGR)
+            blended, _ = self._blend_fixed_watermark_frame(frames[0], completed, frame_mask)
+            return [blended]
+        return self.propainter_inpaint_model.inpaint_fixed_watermark(
+            frames,
+            mask,
+            raft_iter=(
+                8
+                if fast and config.movingWatermarkFastMode.value
+                else None
+            ),
+        )
 
     def fixed_watermark_mode(self, tbar):
         """Remove a fixed watermark from manually selected regions without OCR."""
@@ -335,10 +378,19 @@ class SubtitleRemover:
             raise ValueError(tr['Main']['FixedWatermarkAreaRequired'])
 
         self.append_output(tr['Main']['ProcessingStartRemovingFixedWatermark'])
+        self.append_output(tr['Main']['FixedWatermarkStaticOnlyNote'])
         max_batch_size = max(2, int(config.propainterMaxLoadNum.value))
         overlap = min(10, max(0, max_batch_size // 5))
         if max_batch_size - overlap < 2:
             overlap = 0
+
+        try:
+            scene_starts = {
+                max(0, frame_number - 1)
+                for frame_number in SubtitleDetect.get_scene_div_frame_no(self.video_path)
+            }
+        except Exception:
+            scene_starts = set()
 
         read_cap = create_processing_capture(
             self.video_path,
@@ -361,7 +413,7 @@ class SubtitleRemover:
                 inpainted_frame = inpainted_frames[index]
                 self.video_writer.write(inpainted_frame)
                 self.push_preview_with_comp(
-                    np.clip(frames[index] + mask[:, :, np.newaxis] * 0.3, 0, 255).astype(np.uint8),
+                    self._fixed_watermark_preview(frames[index], mask),
                     inpainted_frame,
                 )
             self.update_progress(tbar, increment=write_count)
@@ -373,6 +425,9 @@ class SubtitleRemover:
                 ret, frame = reader.read()
                 if not ret:
                     break
+
+                if frame_no in scene_starts and pending_frames:
+                    pending_frames = write_processed_batch(pending_frames)
 
                 if is_frame_number_in_ab_sections(frame_no, self.ab_sections):
                     pending_frames.append(frame)
@@ -388,6 +443,245 @@ class SubtitleRemover:
 
             if pending_frames:
                 write_processed_batch(pending_frames)
+        finally:
+            reader.release()
+
+    def _create_moving_watermark_tracker(self):
+        if len(self.sub_areas) != 1:
+            raise ValueError(tr['Main']['MovingWatermarkTemplateRequired'])
+
+        template_source = self.tracking_template_source_path or self.video_path
+        if self.tracking_template_source_path and not os.path.isfile(template_source):
+            raise ValueError(tr['Main']['MovingWatermarkReferenceReadFailed'])
+        reference_frame = read_video_frame(
+            template_source,
+            self.tracking_reference_frame_no,
+            self.fps,
+        )
+        if reference_frame is None:
+            raise ValueError(tr['Main']['MovingWatermarkReferenceReadFailed'])
+
+        source_height, source_width = reference_frame.shape[:2]
+        template_area = self.tracking_template_area
+        if isinstance(template_area, (list, tuple)) and len(template_area) == 1:
+            template_area = template_area[0]
+        if isinstance(template_area, (list, tuple)) and len(template_area) == 4:
+            values = tuple(map(float, template_area))
+            if all(0.0 <= value <= 1.0 for value in values):
+                selected_area = (
+                    round(values[0] * source_height),
+                    round(values[1] * source_height),
+                    round(values[2] * source_width),
+                    round(values[3] * source_width),
+                )
+            else:
+                selected_area = tuple(map(int, values))
+        else:
+            target_area = self.sub_areas[0]
+            selected_area = (
+                round(target_area[0] / max(1, self.frame_height) * source_height),
+                round(target_area[1] / max(1, self.frame_height) * source_height),
+                round(target_area[2] / max(1, self.frame_width) * source_width),
+                round(target_area[3] / max(1, self.frame_width) * source_width),
+            )
+
+        refined_area = refine_watermark_area(reference_frame, selected_area)
+        if refined_area is None:
+            raise ValueError(tr['Main']['MovingWatermarkTemplateRequired'])
+        if tuple(map(int, selected_area)) != tuple(map(int, refined_area)):
+            self.append_output(
+                tr['Main']['MovingWatermarkTemplateRefined'].format(selected_area, refined_area)
+            )
+
+        ymin, ymax, xmin, xmax = refined_area
+        template_image = reference_frame[ymin:ymax, xmin:xmax].copy()
+        normalized_refined_area = (
+            ymin / source_height,
+            ymax / source_height,
+            xmin / source_width,
+            xmax / source_width,
+        )
+        target_area = (
+            round(normalized_refined_area[0] * self.frame_height),
+            round(normalized_refined_area[1] * self.frame_height),
+            round(normalized_refined_area[2] * self.frame_width),
+            round(normalized_refined_area[3] * self.frame_width),
+        )
+        tracker = MovingWatermarkTracker(
+            template_image,
+            target_area,
+            self.mask_size,
+            template_feature_frame=reference_frame,
+        )
+        return tracker, target_area
+
+    def _scan_moving_watermark(self, tracker):
+        self.append_output(tr['Main']['ProcessingStartTrackingWatermark'])
+        started_at = time.time()
+        read_cap = create_processing_capture(
+            self.video_path,
+            self.frame_width,
+            self.frame_height,
+            fps=self.fps,
+            frame_count=self.frame_count,
+            prefer_cuda=False,
+        )
+        reader = FramePrefetcher(read_cap)
+        areas = []
+        scores = []
+        frame_no = 0
+        was_active = False
+        try:
+            while True:
+                ok, frame = reader.read()
+                if not ok:
+                    break
+                active = is_frame_number_in_ab_sections(frame_no, self.ab_sections)
+                if not active:
+                    areas.append(None)
+                    scores.append(0.0)
+                    tracker.last_area = None
+                    tracker.position_history.clear()
+                    was_active = False
+                    frame_no += 1
+                    continue
+
+                force_global = not was_active
+                allow_global = force_global or tracker.last_area is not None or frame_no % 12 == 0
+                area, score = tracker.locate(
+                    frame,
+                    force_global=force_global,
+                    allow_global=allow_global,
+                )
+                areas.append(area)
+                scores.append(float(score))
+                was_active = True
+                frame_no += 1
+        finally:
+            reader.release()
+
+        areas, scores = smooth_tracking_results(areas, scores, self.fps)
+        detected_count = sum(area is not None for area in areas)
+        self.append_output(
+            tr['Main']['MovingWatermarkTrackingSummary'].format(
+                detected_count,
+                len(areas),
+                time.time() - started_at,
+            )
+        )
+        return areas, scores
+
+    @staticmethod
+    def _moving_batch_needs_flush(pending_areas, next_area):
+        if not pending_areas:
+            return False
+        previous = pending_areas[-1]
+        py0, py1, px0, px1 = previous
+        ny0, ny1, nx0, nx1 = next_area
+        template_width = max(1, nx1 - nx0)
+        template_height = max(1, ny1 - ny0)
+        center_distance = np.hypot(
+            (px0 + px1 - nx0 - nx1) / 2,
+            (py0 + py1 - ny0 - ny1) / 2,
+        )
+        if center_distance > max(24.0, 0.75 * np.hypot(template_width, template_height)):
+            return True
+
+        all_areas = pending_areas + [next_area]
+        union_width = max(area[3] for area in all_areas) - min(area[2] for area in all_areas)
+        union_height = max(area[1] for area in all_areas) - min(area[0] for area in all_areas)
+        return union_width > template_width * 2.5 or union_height > template_height * 2.5
+
+    def moving_watermark_mode(self, tbar):
+        """Track one watermark template and inpaint only confidently located frames."""
+        try:
+            scene_starts = {
+                max(0, frame_number - 1)
+                for frame_number in SubtitleDetect.get_scene_div_frame_no(self.video_path)
+            }
+        except Exception:
+            scene_starts = set()
+
+        tracker, _ = self._create_moving_watermark_tracker()
+        tracked_areas, _ = self._scan_moving_watermark(tracker)
+        self.append_output(tr['Main']['ProcessingStartRemovingMovingWatermark'])
+
+        max_batch_size = max(2, int(config.propainterMaxLoadNum.value))
+        overlap = min(10, max(0, max_batch_size // 5))
+        if max_batch_size - overlap < 2:
+            overlap = 0
+
+        read_cap = create_processing_capture(
+            self.video_path,
+            self.frame_width,
+            self.frame_height,
+            fps=self.fps,
+            frame_count=self.frame_count,
+            fallback_cap=self.video_cap,
+            prefer_cuda=False,
+        )
+        reader = FramePrefetcher(read_cap)
+        pending_frames = []
+        pending_masks = []
+        pending_areas = []
+
+        def write_processed_batch(keep_overlap=False):
+            nonlocal pending_frames, pending_masks, pending_areas
+            if not pending_frames:
+                return
+            completed_frames = self._inpaint_fixed_watermark_batch(
+                pending_frames,
+                pending_masks,
+                fast=True,
+            )
+            keep_count = overlap if keep_overlap and len(pending_frames) > overlap else 0
+            write_count = len(pending_frames) - keep_count
+            for index in range(write_count):
+                self.video_writer.write(completed_frames[index])
+                self.push_preview_with_comp(
+                    self._fixed_watermark_preview(pending_frames[index], pending_masks[index]),
+                    completed_frames[index],
+                )
+            self.update_progress(tbar, increment=write_count)
+            if keep_count:
+                pending_frames = pending_frames[write_count:]
+                pending_masks = pending_masks[write_count:]
+                pending_areas = pending_areas[write_count:]
+            else:
+                pending_frames = []
+                pending_masks = []
+                pending_areas = []
+
+        frame_no = 0
+        try:
+            while True:
+                ok, frame = reader.read()
+                if not ok:
+                    break
+                area = tracked_areas[frame_no] if frame_no < len(tracked_areas) else None
+
+                if frame_no in scene_starts and pending_frames:
+                    write_processed_batch()
+
+                if area is None:
+                    write_processed_batch()
+                    self.video_writer.write(frame)
+                    self.update_progress(tbar, increment=1)
+                    self.push_preview_with_comp(frame, frame)
+                    frame_no += 1
+                    continue
+
+                if self._moving_batch_needs_flush(pending_areas, area):
+                    write_processed_batch()
+                frame_mask = self._create_fixed_watermark_mask([area])
+                pending_frames.append(frame)
+                pending_masks.append(frame_mask)
+                pending_areas.append(area)
+                if len(pending_frames) >= max_batch_size:
+                    write_processed_batch(keep_overlap=True)
+                frame_no += 1
+
+            write_processed_batch()
         finally:
             reader.release()
 
@@ -506,7 +800,11 @@ class SubtitleRemover:
     def run(self):
         # 记录开始时间
         start_time = time.time()
+        if self.is_picture and config.inpaintMode.value == InpaintMode.MOVING_WATERMARK:
+            raise ValueError(tr['Main']['MovingWatermarkTemplateRequired'])
         if len(self.sub_areas) == 0:
+            if config.inpaintMode.value == InpaintMode.MOVING_WATERMARK:
+                raise ValueError(tr['Main']['MovingWatermarkTemplateRequired'])
             if config.inpaintMode.value == InpaintMode.FIXED_WATERMARK:
                 raise ValueError(tr['Main']['FixedWatermarkAreaRequired'])
             self.append_output(tr['Main']['FullScreenProcessingNote'])
@@ -528,10 +826,18 @@ class SubtitleRemover:
             if original_frame is None:
                 self.append_output(tr['Main']['ReadImageFailed'].format(self.video_path))
                 return
-            if config.inpaintMode.value == InpaintMode.FIXED_WATERMARK:
+            if config.inpaintMode.value in WATERMARK_INPAINT_MODES:
                 mask = self._create_fixed_watermark_mask()
-                inpainted_frame = self.lama_inpaint.inpaint(original_frame, mask)
-                self.push_preview_with_comp(np.clip(original_frame+mask[:,:,np.newaxis]*0.3,0,255).astype(np.uint8), inpainted_frame, force=True)
+                _, outer_mask, _ = build_fixed_watermark_masks(mask)
+                rgb_frame = cv2.cvtColor(original_frame, cv2.COLOR_BGR2RGB)
+                completed_rgb = self.lama_inpaint.inpaint(rgb_frame, outer_mask)
+                completed_frame = cv2.cvtColor(completed_rgb, cv2.COLOR_RGB2BGR)
+                inpainted_frame, _ = self._blend_fixed_watermark_frame(original_frame, completed_frame, mask)
+                self.push_preview_with_comp(
+                    self._fixed_watermark_preview(original_frame, mask),
+                    inpainted_frame,
+                    force=True,
+                )
             else:
                 sub_detector = SubtitleDetect(self.video_path, self.sub_areas)
                 sub_list = sub_detector.detect_subtitle(original_frame)
@@ -554,6 +860,8 @@ class SubtitleRemover:
                 self.propainter_mode(tbar)
             elif config.inpaintMode.value == InpaintMode.FIXED_WATERMARK:
                 self.fixed_watermark_mode(tbar)
+            elif config.inpaintMode.value == InpaintMode.MOVING_WATERMARK:
+                self.moving_watermark_mode(tbar)
             elif config.inpaintMode.value == InpaintMode.STTN_AUTO:
                 self.sttn_auto_mode(tbar)
             elif config.inpaintMode.value == InpaintMode.STTN_DET:
@@ -592,7 +900,7 @@ class SubtitleRemover:
         self.append_output(tr['Main']['SubtitleRemoverModel'].format(f"{model_friendly_name} ({model_device})"))
         providers = ", ".join(self.hardware_accelerator.onnx_providers)
         providers_str = f" ({providers})" if providers else ""
-        if config.inpaintMode.value != InpaintMode.FIXED_WATERMARK:
+        if config.inpaintMode.value not in WATERMARK_INPAINT_MODES:
             detect_mode_name = list(tr['SubtitleDetectMode'].values())[list(SubtitleDetectMode).index(config.subtitleDetectMode.value)]
             self.append_output(tr['Main']['SubtitleDetectionModel'].format(f"{detect_mode_name}{providers_str}"))
 

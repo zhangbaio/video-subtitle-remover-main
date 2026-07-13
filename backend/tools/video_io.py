@@ -164,8 +164,17 @@ class FFmpegVideoReader:
                 self._process.wait(timeout=5)
 
 
-def create_processing_capture(video_path, width, height, fps=0.0, frame_count=0, fallback_cap=None):
-    prefer_cuda = HardwareAccelerator.instance().has_cuda()
+def create_processing_capture(
+    video_path,
+    width,
+    height,
+    fps=0.0,
+    frame_count=0,
+    fallback_cap=None,
+    prefer_cuda=None,
+):
+    if prefer_cuda is None:
+        prefer_cuda = HardwareAccelerator.instance().has_cuda()
     if prefer_cuda:
         try:
             return FFmpegVideoReader(video_path, width, height, fps=fps, frame_count=frame_count, prefer_cuda=True)

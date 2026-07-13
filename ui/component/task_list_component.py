@@ -35,6 +35,9 @@ class TaskOptions(Enum):
     SUB_AREAS_SOURCE = "sub_areas_source"
     SUBTITLE_INTERVALS = "subtitle_intervals"
     FIXED_WATERMARK_AREAS = "fixed_watermark_areas"
+    MOVING_WATERMARK_TEMPLATE_AREA = "moving_watermark_template_area"
+    MOVING_WATERMARK_REFERENCE_FRAME_NO = "moving_watermark_reference_frame_no"
+    MOVING_WATERMARK_TEMPLATE_SOURCE_PATH = "moving_watermark_template_source_path"
 
 
 def _format_elapsed(seconds):

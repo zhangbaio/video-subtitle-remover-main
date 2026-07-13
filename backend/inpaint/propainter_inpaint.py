@@ -16,7 +16,11 @@ from backend.inpaint.video.model.recurrent_flow_completion import RecurrentFlowC
 from backend.inpaint.video.model.propainter import InpaintGenerator
 from backend.inpaint.video.core.utils import to_tensors
 from backend.inpaint.video.model.misc import get_device
-from backend.tools.inpaint_tools import get_inpaint_area_by_mask
+from backend.tools.inpaint_tools import (
+    build_fixed_watermark_masks,
+    get_fixed_watermark_rois,
+    get_inpaint_area_by_mask,
+)
 
 import warnings
 
@@ -41,6 +45,17 @@ def read_mask(mpath, length, size, flow_mask_dilates=8, mask_dilates=5):
             # 如果是彩色图像，转为灰度
             mpath = cv2.cvtColor(mpath, cv2.COLOR_BGR2GRAY)
         masks_img = [Image.fromarray(mpath)]
+    elif isinstance(mpath, (list, tuple)):
+        for item in mpath:
+            if isinstance(item, Image.Image):
+                masks_img.append(item)
+                continue
+            item = np.asarray(item)
+            if item.ndim == 3 and item.shape[2] == 1:
+                item = item.squeeze(2)
+            elif item.ndim == 3 and item.shape[2] == 3:
+                item = cv2.cvtColor(item, cv2.COLOR_BGR2GRAY)
+            masks_img.append(Image.fromarray(item.astype(np.uint8)))
     # input single img path
     else:
         if isinstance(mpath, str):
@@ -73,6 +88,8 @@ def read_mask(mpath, length, size, flow_mask_dilates=8, mask_dilates=5):
     if len(masks_img) == 1:
         flow_masks = flow_masks * length
         masks_dilated = masks_dilated * length
+    elif len(masks_img) != length:
+        raise ValueError(f"Expected {length} masks, got {len(masks_img)}")
 
     return flow_masks, masks_dilated
 
@@ -187,7 +204,7 @@ class PropainterInpaint:
         model = model.to(self.device).eval()
         return model
 
-    def inpaint(self, frames, mask):
+    def inpaint(self, frames, mask, clear_cuda_cache=True, raft_iter=None):
         if isinstance(frames[0], np.ndarray):
             frames = [Image.fromarray(cv2.cvtColor(f, cv2.COLOR_BGR2RGB)) for f in frames]
         size = frames[0].size
@@ -196,19 +213,6 @@ class PropainterInpaint:
                                               flow_mask_dilates=self.mask_dilation,
                                               mask_dilates=self.mask_dilation)
         w, h = size
-        # for saving the masked frames or video
-        masked_frame_for_save = []
-        for i in range(len(frames)):
-            mask_ = np.expand_dims(np.array(masks_dilated[i]), 2).repeat(3, axis=2) / 255.
-            img = np.array(frames[i])
-            green = np.zeros([h, w, 3])
-            green[:, :, 1] = 255
-            alpha = 0.6
-            # alpha = 1.0
-            fuse_img = (1 - alpha) * img + alpha * green
-            fuse_img = mask_ * fuse_img + (1 - mask_) * img
-            masked_frame_for_save.append(fuse_img.astype(np.uint8))
-
         frames_inp = [np.array(f).astype(np.uint8) for f in frames]
         frames = to_tensors()(frames).unsqueeze(0) * 2 - 1
         flow_masks = to_tensors()(flow_masks).unsqueeze(0)
@@ -216,6 +220,7 @@ class PropainterInpaint:
         frames, flow_masks, masks_dilated = frames.to(self.device), flow_masks.to(self.device), masks_dilated.to(
             self.device)
         video_length = frames.size(1)
+        raft_iter = self.raft_iter if raft_iter is None else max(1, int(raft_iter))
         with torch.no_grad():
             # ---- compute flow ----
             if frames.size(-1) <= 640:
@@ -233,18 +238,20 @@ class PropainterInpaint:
                 for f in range(0, video_length, short_clip_len):
                     end_f = min(video_length, f + short_clip_len)
                     if f == 0:
-                        flows_f, flows_b = self.fix_raft(frames[:, f:end_f], iters=self.raft_iter)
+                        flows_f, flows_b = self.fix_raft(frames[:, f:end_f], iters=raft_iter)
                     else:
-                        flows_f, flows_b = self.fix_raft(frames[:, f - 1:end_f], iters=self.raft_iter)
+                        flows_f, flows_b = self.fix_raft(frames[:, f - 1:end_f], iters=raft_iter)
                     gt_flows_f_list.append(flows_f)
                     gt_flows_b_list.append(flows_b)
-                    torch.cuda.empty_cache()
+                    if clear_cuda_cache:
+                        torch.cuda.empty_cache()
                 gt_flows_f = torch.cat(gt_flows_f_list, dim=1)
                 gt_flows_b = torch.cat(gt_flows_b_list, dim=1)
                 gt_flows_bi = (gt_flows_f, gt_flows_b)
             else:
-                gt_flows_bi = self.fix_raft(frames, iters=self.raft_iter)
-                torch.cuda.empty_cache()
+                gt_flows_bi = self.fix_raft(frames, iters=raft_iter)
+                if clear_cuda_cache:
+                    torch.cuda.empty_cache()
 
             if self.use_half:
                 frames, flow_masks, masks_dilated = frames.half(), flow_masks.half(), masks_dilated.half()
@@ -270,7 +277,8 @@ class PropainterInpaint:
 
                     pred_flows_f.append(pred_flows_bi_sub[0][:, pad_len_s:e_f - s_f - pad_len_e])
                     pred_flows_b.append(pred_flows_bi_sub[1][:, pad_len_s:e_f - s_f - pad_len_e])
-                    torch.cuda.empty_cache()
+                    if clear_cuda_cache:
+                        torch.cuda.empty_cache()
 
                 pred_flows_f = torch.cat(pred_flows_f, dim=1)
                 pred_flows_b = torch.cat(pred_flows_b, dim=1)
@@ -278,7 +286,8 @@ class PropainterInpaint:
             else:
                 pred_flows_bi, _ = self.fix_flow_complete.forward_bidirect_flow(gt_flows_bi, flow_masks)
                 pred_flows_bi = self.fix_flow_complete.combine_flow(gt_flows_bi, pred_flows_bi, flow_masks)
-                torch.cuda.empty_cache()
+                if clear_cuda_cache:
+                    torch.cuda.empty_cache()
 
             # ---- image propagation ----
             masked_frames = frames * (1 - masks_dilated)
@@ -303,7 +312,8 @@ class PropainterInpaint:
                     updated_masks_sub = updated_local_masks_sub.view(b, t, 1, h, w)
                     updated_frames.append(updated_frames_sub[:, pad_len_s:e_f - s_f - pad_len_e])
                     updated_masks.append(updated_masks_sub[:, pad_len_s:e_f - s_f - pad_len_e])
-                    torch.cuda.empty_cache()
+                    if clear_cuda_cache:
+                        torch.cuda.empty_cache()
 
                 updated_frames = torch.cat(updated_frames, dim=1)
                 updated_masks = torch.cat(updated_masks, dim=1)
@@ -313,7 +323,8 @@ class PropainterInpaint:
                                                                        'nearest')
                 updated_frames = frames * (1 - masks_dilated) + prop_imgs.view(b, t, 3, h, w) * masks_dilated
                 updated_masks = updated_local_masks.view(b, t, 1, h, w)
-                torch.cuda.empty_cache()
+                if clear_cuda_cache:
+                    torch.cuda.empty_cache()
 
         ori_frames = frames_inp
         comp_frames = [None] * video_length
@@ -355,10 +366,143 @@ class PropainterInpaint:
                     else:
                         comp_frames[idx] = comp_frames[idx].astype(np.float32) * 0.5 + img.astype(np.float32) * 0.5
                     comp_frames[idx] = comp_frames[idx].astype(np.uint8)
-            torch.cuda.empty_cache()
+            if clear_cuda_cache:
+                torch.cuda.empty_cache()
         # save videos frame
         comp_frames = [cv2.cvtColor(i, cv2.COLOR_RGB2BGR) for i in comp_frames]
         return comp_frames
+
+    def inpaint_fixed_watermark(
+        self,
+        input_frames: List[np.ndarray],
+        selection_mask: np.ndarray,
+        erase_margin=2,
+        feather_radius=12,
+        context=None,
+        raft_iter=None,
+    ):
+        """Inpaint a fixed selection with complete local context and soft edges.
+
+        The regular ``__call__`` path intentionally keeps its subtitle-strip
+        behavior. Fixed watermarks use compact, near-square ROIs which always
+        contain the full mask instead of forcing it into a 3/16-height strip.
+        """
+        if not input_frames:
+            return []
+
+        dynamic_masks = isinstance(selection_mask, (list, tuple))
+        if dynamic_masks:
+            if len(selection_mask) != len(input_frames):
+                raise ValueError(
+                    f"Expected {len(input_frames)} fixed-watermark masks, got {len(selection_mask)}"
+                )
+            selection_masks = []
+            for mask in selection_mask:
+                mask = np.asarray(mask)
+                if mask.ndim == 3:
+                    mask = np.max(mask, axis=2)
+                selection_masks.append(mask)
+            union_selection = np.maximum.reduce(selection_masks)
+            _, union_outer_mask, _ = build_fixed_watermark_masks(
+                union_selection,
+                erase_margin=erase_margin,
+                feather_radius=feather_radius,
+            )
+        else:
+            layers = build_fixed_watermark_masks(
+                selection_mask,
+                erase_margin=erase_margin,
+                feather_radius=feather_radius,
+            )
+            mask_layers = [layers] * len(input_frames)
+            outer_masks = [layers[1]] * len(input_frames)
+            alpha_masks = [layers[2]] * len(input_frames)
+            union_outer_mask = layers[1]
+        rois = get_fixed_watermark_rois(union_outer_mask, context=context, multiple=8)
+        frames_hr = [frame.copy() for frame in input_frames]
+        if not rois:
+            return frames_hr
+
+        for ymin, ymax, xmin, xmax in rois:
+            crop_height = ymax - ymin
+            crop_width = xmax - xmin
+            if crop_height <= 0 or crop_width <= 0:
+                continue
+
+            pad_bottom = (-crop_height) % 8
+            pad_right = (-crop_width) % 8
+            cropped_frames = []
+            for frame in frames_hr:
+                crop = frame[ymin:ymax, xmin:xmax]
+                if pad_bottom or pad_right:
+                    border_type = cv2.BORDER_REFLECT_101 if min(crop.shape[:2]) > 1 else cv2.BORDER_REPLICATE
+                    crop = cv2.copyMakeBorder(
+                        crop,
+                        0,
+                        pad_bottom,
+                        0,
+                        pad_right,
+                        border_type,
+                    )
+                cropped_frames.append(crop)
+
+            if dynamic_masks:
+                local_layers = [
+                    build_fixed_watermark_masks(
+                        mask[ymin:ymax, xmin:xmax],
+                        erase_margin=erase_margin,
+                        feather_radius=feather_radius,
+                        reference_shape=mask.shape,
+                    )
+                    for mask in selection_masks
+                ]
+                local_outer_masks = [layers[1] for layers in local_layers]
+                local_alpha_masks = [layers[2] for layers in local_layers]
+            else:
+                local_outer_masks = [
+                    outer_mask[ymin:ymax, xmin:xmax]
+                    for outer_mask in outer_masks
+                ]
+                local_alpha_masks = [
+                    alpha_mask[ymin:ymax, xmin:xmax]
+                    for alpha_mask in alpha_masks
+                ]
+
+            cropped_masks = []
+            for cropped_mask in local_outer_masks:
+                if pad_bottom or pad_right:
+                    cropped_mask = cv2.copyMakeBorder(
+                        cropped_mask,
+                        0,
+                        pad_bottom,
+                        0,
+                        pad_right,
+                        cv2.BORDER_CONSTANT,
+                        value=0,
+                    )
+                cropped_masks.append(cropped_mask)
+
+            completed_frames = self.inpaint(
+                cropped_frames,
+                cropped_masks,
+                clear_cuda_cache=False,
+                raft_iter=raft_iter,
+            )
+            for frame_index, completed in enumerate(completed_frames):
+                crop_alpha = local_alpha_masks[frame_index][:, :, np.newaxis]
+                original_crop = frames_hr[frame_index][ymin:ymax, xmin:xmax].astype(np.float32)
+                completed_crop = completed[:crop_height, :crop_width].astype(np.float32)
+                blended = completed_crop * crop_alpha + original_crop * (1.0 - crop_alpha)
+                frames_hr[frame_index][ymin:ymax, xmin:xmax] = np.clip(blended, 0, 255).astype(np.uint8)
+
+            del cropped_frames, cropped_masks, completed_frames
+            if dynamic_masks:
+                del local_layers, local_outer_masks, local_alpha_masks
+            gc.collect()
+
+        if getattr(self.device, "type", None) == "cuda":
+            torch.cuda.empty_cache()
+        return frames_hr
 
     def __call__(self, input_frames: List[np.ndarray], input_mask: np.ndarray):
         """
@@ -444,4 +588,3 @@ if __name__ == '__main__':
         video_writer.write(comp_frame)
     video_writer.release()
     print(f'\nAll results are saved in {save_root}')
-
