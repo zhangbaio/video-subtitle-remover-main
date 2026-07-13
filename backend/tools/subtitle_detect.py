@@ -116,25 +116,28 @@ class SubtitleDetect:
         sampled_results = {}  # frame_no -> temp_list
         if sub_remover:
             sub_remover.append_output(tr['Main']['ProcessingStartFindingSubtitles'])
-        while video_cap.isOpened():
-            ret, frame = video_cap.read()
-            # 如果读取视频帧失败（视频读到最后一帧）
-            if not ret:
-                break
-            # 读取视频帧成功
-            current_frame_no += 1
-            if not is_frame_number_in_ab_sections(current_frame_no - 1, effective_ab_sections):
+        try:
+            while video_cap.isOpened():
+                ret, frame = video_cap.read()
+                # 如果读取视频帧失败（视频读到最后一帧）
+                if not ret:
+                    break
+                # 读取视频帧成功
+                current_frame_no += 1
+                if not is_frame_number_in_ab_sections(current_frame_no - 1, effective_ab_sections):
+                    tbar.update(1)
+                    continue
+                # 仅对采样帧执行 OCR 推理
+                if (current_frame_no - 1) % self.SAMPLE_STEP == 0 or self.SAMPLE_STEP <= 1:
+                    temp_list = self.detect_subtitle(frame)
+                    if len(temp_list) > 0:
+                        sampled_results[current_frame_no] = temp_list
                 tbar.update(1)
-                continue
-            # 仅对采样帧执行 OCR 推理
-            if (current_frame_no - 1) % self.SAMPLE_STEP == 0 or self.SAMPLE_STEP <= 1:
-                temp_list = self.detect_subtitle(frame)
-                if len(temp_list) > 0:
-                    sampled_results[current_frame_no] = temp_list
-            tbar.update(1)
-            if sub_remover:
-                sub_remover.progress_total = (100 * float(current_frame_no) / float(frame_count)) // 2
-        video_cap.release()
+                if sub_remover:
+                    sub_remover.progress_total = (100 * float(current_frame_no) / float(frame_count)) // 2
+        finally:
+            video_cap.release()
+            tbar.close()
         # 阶段2：插值填充 — 两个采样帧之间都有字幕时，中间帧也标记为有字幕
         subtitle_frame_no_box_dict = {}
         detected_nos = sorted(sampled_results.keys())

@@ -23,6 +23,7 @@ It mainly implements the following functionalities:
 - Supports multi-selection of images for batch removal of watermark text
 - Supports fixed-watermark removal: tightly select a stationary logo/overlay and inpaint it with a real ProPainter mask, without OCR
 - Supports automatic moving-watermark tracking: seek to a clear reference frame and select one watermark; the app tracks moving or corner-switching positions throughout the video and leaves low-confidence/no-watermark frames untouched
+- Supports combined subtitle + fixed/moving watermark modes: subtitle and watermark selections remain separate, while their per-frame masks are merged into one decode/inpaint/encode pass
 - During folder batches, once the current video enters GPU inpainting the CPU preprocesses exactly one next video; the following task can reuse its tracking and scene data immediately
 - Fast moving-watermark mode is enabled by default to reduce optical-flow work and dynamic-mask memory for compact logos; turn it off when maximum quality matters more than speed
 
@@ -80,7 +81,13 @@ options:
                         Output video file path (optional)
   --subtitle-area-coords YMIN YMAX XMIN XMAX, -c YMIN YMAX XMIN XMAX
                         Subtitle area coordinates (ymin ymax xmin xmax). Can be specified multiple times for multiple areas.
-  --inpaint-mode {sttn-auto,sttn-det,lama,propainter,opencv,fixed-watermark,moving-watermark}
+  --watermark-area-coords YMIN YMAX XMIN XMAX, -w YMIN YMAX XMIN XMAX
+                        Watermark area coordinates (ymin ymax xmin xmax). Can be specified multiple times for fixed watermarks.
+  --watermark-reference-frame WATERMARK_REFERENCE_FRAME
+                        Zero-based reference frame used by moving-watermark modes (default: 0).
+  --watermark-template-source WATERMARK_TEMPLATE_SOURCE
+                        Optional video containing the moving-watermark reference template.
+  --inpaint-mode {sttn-auto,sttn-det,lama,propainter,opencv,fixed-watermark,moving-watermark,subtitle-fixed-watermark,subtitle-moving-watermark}
                         Inpaint mode, default is sttn-auto
 ```
 ## Demonstration
@@ -242,6 +249,7 @@ Modify the values in backend/config.py and try different removal algorithms. Her
 > - InpaintMode.STTN algorithm: Good for live-action videos and fast in speed, capable of skipping subtitle detection
 > - InpaintMode.LAMA algorithm: Best for images and effective for animated videos, moderate speed, unable to skip subtitle detection
 > - InpaintMode.PROPAINTER algorithm: Consumes a significant amount of VRAM, slower in speed, works better for videos with very intense movement
+> - InpaintMode.SUBTITLE_FIXED_WATERMARK / SUBTITLE_MOVING_WATERMARK: Keep subtitle and watermark selections in separate layers, merge their per-frame masks, and generate the final video in one ProPainter pass
 
 - Using the STTN algorithm
 

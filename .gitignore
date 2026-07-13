@@ -369,6 +369,9 @@ out*.mp4
 test*.py
 !tests/test_moving_mask.py
 !tests/test_safe_optimizations.py
+!tests/test_combined_removal.py
+!tests/test_combined_ui.py
+!tests/test_task_completion_metadata.py
 test_*.mp4
 test*_no_sub*.mp4
 /test/coods/

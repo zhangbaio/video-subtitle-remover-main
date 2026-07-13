@@ -52,6 +52,8 @@ class Config(QConfig):
     - InpaintMode.PROPAINTER 算法： 需要消耗大量显存，速度较慢，对运动非常剧烈的视频效果较好
     - InpaintMode.FIXED_WATERMARK 固定水印：手工选区作为真实遮罩，ProPainter全帧修复
     - InpaintMode.MOVING_WATERMARK 移动水印：模板跟踪生成逐帧动态遮罩
+    - InpaintMode.SUBTITLE_FIXED_WATERMARK 字幕与固定水印：合并两类遮罩后一次修复
+    - InpaintMode.SUBTITLE_MOVING_WATERMARK 字幕与移动水印：字幕遮罩与逐帧跟踪遮罩联合修复
     """
     # 【设置inpaint算法】
     inpaintMode = OptionsConfigItem("Main", "InpaintMode", InpaintMode.STTN_AUTO, OptionsValidator(InpaintMode), EnumSerializer(InpaintMode))

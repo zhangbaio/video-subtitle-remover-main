@@ -20,7 +20,12 @@ from ui.component.video_display_component import VideoDisplayComponent
 from ui.component.task_list_component import TaskListComponent, TaskStatus, TaskOptions
 from ui.icon.my_fluent_icon import MyFluentIcon
 from backend.config import config, tr
-from backend.tools.constant import InpaintMode
+from backend.tools.constant import (
+    InpaintMode,
+    uses_fixed_watermark,
+    uses_moving_watermark,
+    uses_subtitles,
+)
 from backend.tools.subtitle_detect import auto_detect_subtitle_area, detect_subtitle_intervals
 from backend.tools.subtitle_remover_remote_call import SubtitleRemoverRemoteCall
 from backend.tools.process_manager import ProcessManager
@@ -29,11 +34,6 @@ from backend.tools.watermark_tracker import (
     build_moving_watermark_preprocess_key,
     preprocess_moving_watermark_to_file,
 )
-
-WATERMARK_INPAINT_MODES = frozenset((
-    InpaintMode.FIXED_WATERMARK,
-    InpaintMode.MOVING_WATERMARK,
-))
 
 _CHINESE_DIGITS = {
     "零": 0,
@@ -237,9 +237,9 @@ class HomeInterface(QWidget):
     toggle_buttons_signal = Signal(bool)  # True=显示运行按钮, False=显示停止按钮
     task_status_signal = Signal(int, object)  # (task_index, TaskStatus)
     select_task_signal = Signal(int)  # task_index
-    auto_subtitle_area_signal = Signal(list, float)
-    auto_subtitle_area_error_signal = Signal(str)
-    auto_subtitle_area_running_signal = Signal(bool)
+    auto_subtitle_area_signal = Signal(int, str, int, list, float)
+    auto_subtitle_area_error_signal = Signal(int, str, int, str)
+    auto_subtitle_area_running_signal = Signal(bool, int)
     processing_phase_signal = Signal(str, str)
     def __init__(self, parent=None):
         super().__init__(parent=parent)
@@ -268,7 +268,10 @@ class HomeInterface(QWidget):
         self._saved_inpaint_mode = None  # 保存图片锁定前的 inpaint 模式
         self._video_cap_lock = threading.Lock()  # 保护 video_cap 的线程锁
         self._selection_change_source = None
+        self._selection_target = "subtitle"
         self._auto_area_button_running = False
+        self._auto_area_request_token = 0
+        self._active_auto_area_request = None
         self._is_processing = False
         self.current_processing_batch_id = None
         self.current_processing_task_start_time = None
@@ -312,7 +315,7 @@ class HomeInterface(QWidget):
         self.task_status_signal.connect(lambda idx, status: self.task_list_component.update_task_status(idx, status))
         self.select_task_signal.connect(self.task_list_component.select_task)
         self.auto_subtitle_area_signal.connect(self.on_auto_subtitle_area_detected)
-        self.auto_subtitle_area_error_signal.connect(lambda message: self.append_output(message))
+        self.auto_subtitle_area_error_signal.connect(self.on_auto_subtitle_area_error)
         self.auto_subtitle_area_running_signal.connect(self.set_auto_area_button_running)
         self.processing_phase_signal.connect(self.on_processing_phase)
         config.inpaintMode.valueChanged.connect(self.on_inpaint_mode_changed)
@@ -327,6 +330,12 @@ class HomeInterface(QWidget):
         # 左侧视频区域
         left_layout = QVBoxLayout()
         left_layout.setSpacing(8)
+
+        self.selection_target_button = PushButton("", self)
+        self.selection_target_button.setIcon(FluentIcon.EDIT)
+        self.selection_target_button.clicked.connect(self.toggle_selection_target)
+        self.selection_target_button.setVisible(False)
+        left_layout.addWidget(self.selection_target_button)
         
         # 创建视频显示组件
         self.video_display_component = VideoDisplayComponent(self)
@@ -474,8 +483,110 @@ class HomeInterface(QWidget):
         return self._displayed_frame_no == frame_no
 
     @staticmethod
-    def _is_watermark_mode(mode=None):
-        return (mode or config.inpaintMode.value) in WATERMARK_INPAINT_MODES
+    def _is_combined_mode(mode=None):
+        mode = mode or config.inpaintMode.value
+        return uses_subtitles(mode) and (
+            uses_fixed_watermark(mode) or uses_moving_watermark(mode)
+        )
+
+    @staticmethod
+    def _uses_subtitle_intervals(mode=None):
+        mode = mode or config.inpaintMode.value
+        # 联合模式由后端一次性执行精确逐帧 OCR；这里不再做完整区间
+        # 预分析，避免同一视频重复 OCR。后台仍会提前自动识别字幕区域。
+        return mode == InpaintMode.STTN_AUTO
+
+    def _selection_target_for_mode(self, mode=None):
+        mode = mode or config.inpaintMode.value
+        if self._is_combined_mode(mode):
+            return self._selection_target
+        if uses_fixed_watermark(mode) or uses_moving_watermark(mode):
+            return "watermark"
+        return "subtitle"
+
+    def _update_selection_target_button(self):
+        target_key = (
+            "CombinedSelectionWatermark"
+            if self._selection_target == "watermark"
+            else "CombinedSelectionSubtitle"
+        )
+        self.selection_target_button.setText(
+            f"{tr['Setting']['CombinedSelectionTarget']}: {tr['Setting'][target_key]}"
+        )
+
+    def toggle_selection_target(self):
+        if (
+            self._is_processing
+            or self._auto_area_button_running
+            or not self._is_combined_mode()
+        ):
+            return
+        self._selection_target = (
+            "watermark" if self._selection_target == "subtitle" else "subtitle"
+        )
+        self._update_selection_target_button()
+        task_index = self.task_list_component.get_current_task_index()
+        if task_index >= 0 and uses_moving_watermark(config.inpaintMode.value):
+            if self._selection_target == "watermark":
+                self._show_moving_watermark_reference(task_index)
+            else:
+                task = self.task_list_component.get_task(task_index)
+                if task is not None and (
+                    not self.video_path
+                    or os.path.abspath(self.video_path) != os.path.abspath(task.path)
+                ):
+                    self.load_video(task.path)
+        self._refresh_combined_selection_layers(task_index)
+
+    def _subtitle_default_preview_areas(self):
+        areas = []
+        for area in (config.subtitleSelectionAreas.value or "").split(";"):
+            try:
+                ymin, ymax, xmin, xmax = map(float, area.split(","))
+            except (TypeError, ValueError):
+                continue
+            if ymax > ymin and xmax > xmin:
+                areas.append((ymin, ymax, xmin, xmax))
+        return areas
+
+    def _watermark_preview_areas_for_task(self, task_index, mode=None):
+        mode = mode or config.inpaintMode.value
+        if uses_fixed_watermark(mode):
+            normalized_areas = self._sanitize_normalized_areas(
+                self.task_list_component.get_task_option(
+                    task_index, TaskOptions.FIXED_WATERMARK_AREAS, []
+                )
+            )
+        elif uses_moving_watermark(mode):
+            normalized_area, _, _ = self._moving_watermark_template_for_task(task_index)
+            normalized_areas = [normalized_area] if normalized_area is not None else []
+        else:
+            normalized_areas = []
+        return self.video_display_component.normalized_video_coordinates_to_preview_coordinates(
+            normalized_areas
+        )
+
+    def _refresh_combined_selection_layers(self, task_index=None):
+        mode = config.inpaintMode.value
+        if not self._is_combined_mode(mode):
+            return
+        if task_index is None:
+            task_index = self.task_list_component.get_current_task_index()
+        if task_index < 0:
+            self.video_display_component.set_selection_overlay([])
+            return
+        subtitle_areas = self.task_list_component.get_task_option(
+            task_index, TaskOptions.SUB_AREAS, []
+        )
+        watermark_areas = self._watermark_preview_areas_for_task(task_index, mode)
+        if self._selection_target == "watermark":
+            self.video_display_component.set_selection_colors("#ff8c00", "#ffb347")
+            self.video_display_component.set_selection_overlay(subtitle_areas, "#00b7ff")
+            self.video_display_component.set_selection_rects(watermark_areas)
+        else:
+            self.video_display_component.set_selection_colors("#00b7ff", "#64d8ff")
+            self.video_display_component.set_selection_overlay(watermark_areas, "#ff8c00")
+            self.video_display_component.set_selection_rects(subtitle_areas)
 
     def ab_sections_changed(self, ab_sections):
         if self._is_processing:
@@ -491,7 +602,9 @@ class HomeInterface(QWidget):
         get_current_task_index = self.task_list_component.get_current_task_index()
         if get_current_task_index == -1:
             return
-        if config.inpaintMode.value == InpaintMode.FIXED_WATERMARK:
+        mode = config.inpaintMode.value
+        selection_target = self._selection_target_for_mode(mode)
+        if uses_fixed_watermark(mode) and selection_target == "watermark":
             normalized_areas = self._sanitize_normalized_areas(
                 self.video_display_component.preview_coordinates_to_normalized_video_coordinates(
                     selections
@@ -505,9 +618,16 @@ class HomeInterface(QWidget):
             if self._selection_change_source is None:
                 self._save_fixed_watermark_areas(normalized_areas)
                 self._propagate_fixed_watermark_areas(get_current_task_index, normalized_areas)
+            if self._is_combined_mode(mode):
+                subtitle_areas = self.task_list_component.get_task_option(
+                    get_current_task_index, TaskOptions.SUB_AREAS, []
+                )
+                self.video_display_component.set_selection_overlay(
+                    subtitle_areas, "#00b7ff"
+                )
             return
 
-        if config.inpaintMode.value == InpaintMode.MOVING_WATERMARK:
+        if uses_moving_watermark(mode) and selection_target == "watermark":
             # The tracking MVP intentionally uses one tight template. Keep the
             # most recently created/active selection if the generic selector
             # contains more than one rectangle.
@@ -550,12 +670,26 @@ class HomeInterface(QWidget):
                     reference_frame_no,
                     template_source_path,
                 )
+            if self._is_combined_mode(mode):
+                subtitle_areas = self.task_list_component.get_task_option(
+                    get_current_task_index, TaskOptions.SUB_AREAS, []
+                )
+                self.video_display_component.set_selection_overlay(
+                    subtitle_areas, "#00b7ff"
+                )
             return
 
+        if not uses_subtitles(mode):
+            return
         self.task_list_component.update_task_option(get_current_task_index, TaskOptions.SUB_AREAS, selections)
         source = self._selection_change_source or "manual"
         self.task_list_component.update_task_option(get_current_task_index, TaskOptions.SUB_AREAS_SOURCE, source)
         self.task_list_component.update_task_option(get_current_task_index, TaskOptions.SUBTITLE_INTERVALS, None)
+        if self._is_combined_mode(mode):
+            self.video_display_component.set_selection_overlay(
+                self._watermark_preview_areas_for_task(get_current_task_index, mode),
+                "#ff8c00",
+            )
 
     @staticmethod
     def _parse_fixed_watermark_areas(value):
@@ -762,6 +896,28 @@ class HomeInterface(QWidget):
             template_source_path,
         )
 
+    def _show_moving_watermark_reference(self, task_index):
+        """Load and seek the immutable source frame used by a moving template."""
+        normalized_area, reference_frame_no, template_source_path = (
+            self._moving_watermark_template_for_task(task_index)
+        )
+        task = self.task_list_component.get_task(task_index)
+        if task is None or normalized_area is None or reference_frame_no is None:
+            return False
+        template_source_path = template_source_path or task.path
+        self._selection_change_source = "moving_template"
+        try:
+            if (
+                not self.video_path
+                or os.path.abspath(self.video_path)
+                != os.path.abspath(template_source_path)
+            ):
+                if not self.load_video(template_source_path):
+                    return False
+            return self._seek_preview_to_frame(reference_frame_no)
+        finally:
+            self._selection_change_source = None
+
     def on_task_selected(self, index, file_path):
         """处理任务被选中事件
         
@@ -774,7 +930,37 @@ class HomeInterface(QWidget):
         ab_sections = self.task_list_component.get_task_option(index, TaskOptions.AB_SECTIONS, [])
         self.video_display_component.set_ab_sections(ab_sections)
         selections = self.task_list_component.get_task_option(index, TaskOptions.SUB_AREAS, [])
-        if config.inpaintMode.value == InpaintMode.FIXED_WATERMARK:
+        mode = config.inpaintMode.value
+        if self._is_combined_mode(mode):
+            if not selections:
+                selections = self._subtitle_default_preview_areas()
+                if selections:
+                    self.task_list_component.update_task_option(
+                        index, TaskOptions.SUB_AREAS, selections
+                    )
+                    self.task_list_component.update_task_option(
+                        index, TaskOptions.SUB_AREAS_SOURCE, "default"
+                    )
+            if uses_fixed_watermark(mode):
+                normalized_areas = self._sanitize_normalized_areas(
+                    self.task_list_component.get_task_option(
+                        index, TaskOptions.FIXED_WATERMARK_AREAS, []
+                    )
+                )
+                if not normalized_areas:
+                    normalized_areas = self._parse_fixed_watermark_areas(
+                        config.fixedWatermarkSelectionAreas.value
+                    )
+                    if normalized_areas:
+                        self.task_list_component.update_task_option(
+                            index, TaskOptions.FIXED_WATERMARK_AREAS, normalized_areas
+                        )
+                        self._propagate_fixed_watermark_areas(index, normalized_areas)
+            elif uses_moving_watermark(mode) and self._selection_target == "watermark":
+                self._show_moving_watermark_reference(index)
+            self._refresh_combined_selection_layers(index)
+            return
+        if mode == InpaintMode.FIXED_WATERMARK:
             normalized_areas = self._sanitize_normalized_areas(
                 self.task_list_component.get_task_option(
                     index, TaskOptions.FIXED_WATERMARK_AREAS, []
@@ -804,7 +990,7 @@ class HomeInterface(QWidget):
             finally:
                 self._selection_change_source = None
             return
-        if config.inpaintMode.value == InpaintMode.MOVING_WATERMARK:
+        if mode == InpaintMode.MOVING_WATERMARK:
             normalized_area, reference_frame_no, template_source_path = (
                 self._moving_watermark_template_for_task(index)
             )
@@ -1008,46 +1194,93 @@ class HomeInterface(QWidget):
         self.running_process = None
         self.last_worker_job_succeeded = False
 
+    def _refresh_interaction_controls(self):
+        """Apply one consistent lock state for processing and manual OCR."""
+        interactive = not self._is_processing and not self._auto_area_button_running
+        subtitle_mode = uses_subtitles(config.inpaintMode.value)
+        self.video_display_component.set_dragger_enabled(interactive)
+        self.task_list_component.setEnabled(interactive)
+        self.file_button.setEnabled(interactive)
+        self.folder_button.setEnabled(interactive)
+        self.batch_folder_button.setEnabled(interactive)
+        self.clear_list_button.setEnabled(interactive)
+        self.selection_target_button.setEnabled(
+            interactive and self._is_combined_mode()
+        )
+        self.run_button.setEnabled(interactive)
+        self.auto_area_button.setEnabled(interactive and subtitle_mode)
+        self.setting_interface.set_batch_controls_enabled(
+            interactive,
+            mode_enabled=self._saved_inpaint_mode is None,
+            subtitle_enabled=subtitle_mode,
+            moving_enabled=uses_moving_watermark(config.inpaintMode.value),
+        )
+
     @Slot(bool)
     def _toggle_buttons(self, show_run):
         """线程安全地切换按钮可见性"""
         self._is_processing = not show_run
         self.run_button.setVisible(show_run)
         self.stop_button.setVisible(not show_run)
-        self.video_display_component.set_dragger_enabled(show_run)
-        self.task_list_component.setEnabled(show_run)
-        self.file_button.setEnabled(show_run)
-        self.folder_button.setEnabled(show_run)
-        self.batch_folder_button.setEnabled(show_run)
-        self.clear_list_button.setEnabled(show_run and not self._auto_area_button_running)
-        self.auto_area_button.setEnabled(
-            show_run
-            and not self._auto_area_button_running
-            and not self._is_watermark_mode()
-        )
-        self.setting_interface.set_inpaint_mode_enabled(
-            show_run and self._saved_inpaint_mode is None
-        )
+        self._refresh_interaction_controls()
 
-    @Slot(bool)
-    def set_auto_area_button_running(self, running):
+    @Slot(bool, int)
+    def set_auto_area_button_running(self, running, request_token):
+        active_request = self._active_auto_area_request
+        if active_request is None or active_request[0] != request_token:
+            return
         self._auto_area_button_running = running
-        watermark_mode = self._is_watermark_mode()
-        self.clear_list_button.setEnabled(not running and not self._is_processing)
-        self.auto_area_button.setEnabled(not running and not watermark_mode)
+        if not running:
+            self._active_auto_area_request = None
         self.auto_area_button.setText("识别中..." if running else "自动框选")
+        self._refresh_interaction_controls()
 
     @Slot(object)
     def on_inpaint_mode_changed(self, mode):
+        self.task_list_component.resync_completion_states()
         fixed_watermark_mode = mode == InpaintMode.FIXED_WATERMARK
         moving_watermark_mode = mode == InpaintMode.MOVING_WATERMARK
-        watermark_mode = self._is_watermark_mode(mode)
-        self.setting_interface.set_subtitle_controls_enabled(not watermark_mode)
-        self.auto_area_button.setEnabled(
-            not self._auto_area_button_running and not watermark_mode
-        )
+        combined_mode = self._is_combined_mode(mode)
+        self.selection_target_button.setVisible(combined_mode)
+        self._update_selection_target_button()
+        if not combined_mode:
+            self.video_display_component.reset_selection_layers()
+        self._refresh_interaction_controls()
         task_index = self.task_list_component.get_current_task_index()
         if task_index < 0:
+            return
+
+        if combined_mode:
+            subtitle_areas = self.task_list_component.get_task_option(
+                task_index, TaskOptions.SUB_AREAS, []
+            )
+            if not subtitle_areas:
+                subtitle_areas = self._subtitle_default_preview_areas()
+                if subtitle_areas:
+                    self.task_list_component.update_task_option(
+                        task_index, TaskOptions.SUB_AREAS, subtitle_areas
+                    )
+                    self.task_list_component.update_task_option(
+                        task_index, TaskOptions.SUB_AREAS_SOURCE, "default"
+                    )
+            if uses_fixed_watermark(mode):
+                normalized_areas = self._sanitize_normalized_areas(
+                    self.task_list_component.get_task_option(
+                        task_index, TaskOptions.FIXED_WATERMARK_AREAS, []
+                    )
+                )
+                if not normalized_areas:
+                    normalized_areas = self._parse_fixed_watermark_areas(
+                        config.fixedWatermarkSelectionAreas.value
+                    )
+                    if normalized_areas:
+                        self.task_list_component.update_task_option(
+                            task_index, TaskOptions.FIXED_WATERMARK_AREAS, normalized_areas
+                        )
+                        self._propagate_fixed_watermark_areas(task_index, normalized_areas)
+            elif uses_moving_watermark(mode) and self._selection_target == "watermark":
+                self._show_moving_watermark_reference(task_index)
+            self._refresh_combined_selection_layers(task_index)
             return
 
         if fixed_watermark_mode:
@@ -1112,7 +1345,7 @@ class HomeInterface(QWidget):
             self._selection_change_source = None
 
     def _task_needs_auto_area(self, task_index, video_path):
-        if self._is_watermark_mode():
+        if not uses_subtitles(config.inpaintMode.value):
             return False
         subtitle_areas = self.task_list_component.get_task_option(task_index, TaskOptions.SUB_AREAS, [])
         subtitle_areas_source = self.task_list_component.get_task_option(task_index, TaskOptions.SUB_AREAS_SOURCE, "")
@@ -1172,7 +1405,7 @@ class HomeInterface(QWidget):
     def _task_needs_subtitle_intervals(self, task_index, video_path):
         intervals = self.task_list_component.get_task_option(task_index, TaskOptions.SUBTITLE_INTERVALS, None)
         return (
-            config.inpaintMode.value == InpaintMode.STTN_AUTO
+            self._uses_subtitle_intervals(config.inpaintMode.value)
             and not is_image_file(video_path)
             and intervals is None
         )
@@ -1210,7 +1443,7 @@ class HomeInterface(QWidget):
         future.add_done_callback(_done_callback)
 
     def _schedule_pending_subtitle_interval_detections(self):
-        if config.inpaintMode.value != InpaintMode.STTN_AUTO:
+        if not self._uses_subtitle_intervals(config.inpaintMode.value):
             return
         for task_index, task in self.task_list_component.get_pending_tasks():
             result, _, _ = self._get_auto_area_detection_result(task.path)
@@ -1247,11 +1480,52 @@ class HomeInterface(QWidget):
             self.append_log_signal.emit([f"{log_prefix}自动框选完成: {detected_areas}, 置信度 {confidence:.2f}"])
         return preview_areas
 
+    @staticmethod
+    def _auto_area_request_path(path):
+        return os.path.normcase(os.path.abspath(os.fspath(path)))
+
+    def _is_current_auto_area_request(self, task_index, video_path, request_token):
+        active_request = self._active_auto_area_request
+        normalized_path = self._auto_area_request_path(video_path)
+        if active_request != (request_token, task_index, normalized_path):
+            return False
+        if self._is_processing:
+            return False
+        task = self.task_list_component.get_task(task_index)
+        if task is None or self._auto_area_request_path(task.path) != normalized_path:
+            return False
+        if self.task_list_component.get_current_task_index() != task_index:
+            return False
+        return bool(
+            self.video_path
+            and self._auto_area_request_path(self.video_path) == normalized_path
+        )
+
+    def _invalidate_auto_area_request(self):
+        self._auto_area_request_token += 1
+        self._active_auto_area_request = None
+        self._auto_area_button_running = False
+
+    @Slot(int, str, int, str)
+    def on_auto_subtitle_area_error(
+        self,
+        task_index,
+        video_path,
+        request_token,
+        message,
+    ):
+        if self._is_current_auto_area_request(
+            task_index, video_path, request_token
+        ):
+            self.append_output(message)
+
     def auto_area_button_clicked(self):
+        if self._is_processing or self._auto_area_button_running:
+            return
         if not self.video_path:
             self.append_output(tr['SubtitleExtractorGUI']['OpenVideoFirst'])
             return
-        if self._is_watermark_mode():
+        if not uses_subtitles(config.inpaintMode.value):
             message_key = (
                 'MovingWatermarkTemplateRequired'
                 if config.inpaintMode.value == InpaintMode.MOVING_WATERMARK
@@ -1269,25 +1543,74 @@ class HomeInterface(QWidget):
                 self.append_output(tr['SubtitleExtractorGUI']['OpenVideoFirst'])
                 return
 
-        video_path = self.video_path
+        current_task = self.task_list_component.get_task(current_task_index)
+        if current_task is None:
+            self.append_output(tr['SubtitleExtractorGUI']['OpenVideoFirst'])
+            return
+        video_path = current_task.path
+        if self._is_combined_mode():
+            self._selection_target = "subtitle"
+            self._update_selection_target_button()
+        if (
+            not self.video_path
+            or self._auto_area_request_path(self.video_path)
+            != self._auto_area_request_path(video_path)
+        ):
+            if not self.load_video(video_path):
+                self.append_output(
+                    tr['SubtitleExtractorGUI']['OpenVideoFailed'].format(video_path)
+                )
+                return
+        if self._is_combined_mode():
+            self._refresh_combined_selection_layers(current_task_index)
+
+        self._auto_area_request_token += 1
+        request_token = self._auto_area_request_token
+        self._active_auto_area_request = (
+            request_token,
+            current_task_index,
+            self._auto_area_request_path(video_path),
+        )
         self.append_output("开始自动框选字幕区域...")
-        self.auto_subtitle_area_running_signal.emit(True)
+        self.auto_subtitle_area_running_signal.emit(True, request_token)
 
         def task():
             try:
                 areas, confidence = auto_detect_subtitle_area(video_path)
-                self.auto_subtitle_area_signal.emit(areas, confidence)
+                self.auto_subtitle_area_signal.emit(
+                    current_task_index,
+                    video_path,
+                    request_token,
+                    areas,
+                    confidence,
+                )
             except Exception as e:
                 traceback.print_exc()
-                self.auto_subtitle_area_error_signal.emit(f"自动框选失败: {e}")
+                self.auto_subtitle_area_error_signal.emit(
+                    current_task_index,
+                    video_path,
+                    request_token,
+                    f"自动框选失败: {e}",
+                )
             finally:
-                self.auto_subtitle_area_running_signal.emit(False)
+                self.auto_subtitle_area_running_signal.emit(False, request_token)
 
         threading.Thread(target=task, daemon=True).start()
 
-    @Slot(list, float)
-    def on_auto_subtitle_area_detected(self, areas, confidence):
-        if self._is_watermark_mode():
+    @Slot(int, str, int, list, float)
+    def on_auto_subtitle_area_detected(
+        self,
+        task_index,
+        video_path,
+        request_token,
+        areas,
+        confidence,
+    ):
+        if not self._is_current_auto_area_request(
+            task_index, video_path, request_token
+        ):
+            return
+        if not uses_subtitles(config.inpaintMode.value):
             return
         if not areas:
             self.append_output("自动框选失败: 未找到可用字幕区域")
@@ -1298,15 +1621,19 @@ class HomeInterface(QWidget):
             self.append_output("自动框选失败: 无法转换字幕区域坐标")
             return
 
+        if self._is_combined_mode():
+            self._selection_target = "subtitle"
+            self._update_selection_target_button()
         self.video_display_component.set_selection_rects(preview_areas)
         self.video_display_component.save_selections_to_config()
 
-        current_task_index = self.task_list_component.get_current_task_index()
-        if current_task_index >= 0:
-            self.task_list_component.update_task_option(current_task_index, TaskOptions.SUB_AREAS, preview_areas)
-            self.task_list_component.update_task_option(current_task_index, TaskOptions.SUB_AREAS_SOURCE, "auto")
-            self.task_list_component.update_task_option(current_task_index, TaskOptions.SUBTITLE_INTERVALS, None)
-            self._schedule_subtitle_interval_detection(current_task_index, self.video_path, areas, self.task_list_component.get_task_option(current_task_index, TaskOptions.AB_SECTIONS, []))
+        if task_index >= 0:
+            self.task_list_component.update_task_option(task_index, TaskOptions.SUB_AREAS, preview_areas)
+            self.task_list_component.update_task_option(task_index, TaskOptions.SUB_AREAS_SOURCE, "auto")
+            self.task_list_component.update_task_option(task_index, TaskOptions.SUBTITLE_INTERVALS, None)
+            self._schedule_subtitle_interval_detection(task_index, video_path, areas, self.task_list_component.get_task_option(task_index, TaskOptions.AB_SECTIONS, []))
+            if self._is_combined_mode():
+                self._refresh_combined_selection_layers(task_index)
 
         if confidence <= 0:
             self.append_output(f"未检测到稳定字幕，已使用默认底部区域: {areas}")
@@ -1317,7 +1644,7 @@ class HomeInterface(QWidget):
         inpaint_mode = inpaint_mode or config.inpaintMode.value
         subtitle_areas = self.task_list_component.get_task_option(task_index, TaskOptions.SUB_AREAS, [])
         subtitle_areas_source = self.task_list_component.get_task_option(task_index, TaskOptions.SUB_AREAS_SOURCE, "")
-        if inpaint_mode == InpaintMode.FIXED_WATERMARK:
+        if not uses_subtitles(inpaint_mode) and uses_fixed_watermark(inpaint_mode):
             normalized_areas = self._sanitize_normalized_areas(
                 self.task_list_component.get_task_option(
                     task_index, TaskOptions.FIXED_WATERMARK_AREAS, []
@@ -1331,7 +1658,7 @@ class HomeInterface(QWidget):
             if not preview_areas:
                 raise ValueError(tr['Main']['FixedWatermarkAreaRequired'])
             return preview_areas
-        if inpaint_mode == InpaintMode.MOVING_WATERMARK:
+        if not uses_subtitles(inpaint_mode) and uses_moving_watermark(inpaint_mode):
             normalized_area, reference_frame_no, _ = self._moving_watermark_template_for_task(
                 task_index
             )
@@ -1380,6 +1707,8 @@ class HomeInterface(QWidget):
                 traceback.print_exc()
                 self.append_log_signal.emit([f"运行前自动框选失败: {e}"])
 
+        if self._is_combined_mode(inpaint_mode):
+            raise ValueError(tr['Main']['CombinedSubtitleAreaRequired'])
         subtitle_areas = [(0, self.frame_height, 0, self.frame_width)]
         self.task_list_component.update_task_option(task_index, TaskOptions.SUB_AREAS, subtitle_areas)
         self.task_list_component.update_task_option(task_index, TaskOptions.SUB_AREAS_SOURCE, "fallback")
@@ -1387,7 +1716,7 @@ class HomeInterface(QWidget):
 
     def ensure_subtitle_intervals_before_run(self, task_index, video_path, subtitle_areas_video, inpaint_mode=None):
         inpaint_mode = inpaint_mode or config.inpaintMode.value
-        if inpaint_mode != InpaintMode.STTN_AUTO or is_image_file(video_path):
+        if not self._uses_subtitle_intervals(inpaint_mode) or is_image_file(video_path):
             return None
 
         intervals = self.task_list_component.get_task_option(task_index, TaskOptions.SUBTITLE_INTERVALS, None)
@@ -1565,7 +1894,7 @@ class HomeInterface(QWidget):
             return
         artifact_key = request["key"]
         with self._moving_preprocess_lock:
-            if self._active_run_mode != InpaintMode.MOVING_WATERMARK:
+            if not uses_moving_watermark(self._active_run_mode):
                 return
             if (
                 artifact_key in self._moving_preprocess_results
@@ -1685,7 +2014,7 @@ class HomeInterface(QWidget):
         if (
             phase != "inpaint_started"
             or not self._is_processing
-            or self._active_run_mode != InpaintMode.MOVING_WATERMARK
+            or not uses_moving_watermark(self._active_run_mode)
             or not config.hardwareAcceleration.value
         ):
             return
@@ -1696,7 +2025,11 @@ class HomeInterface(QWidget):
         self._schedule_next_moving_watermark_preprocess(current_index)
 
     def run_button_clicked(self):
+        if self._auto_area_button_running:
+            self.append_output("自动框选完成后才能开始处理")
+            return
         run_mode = config.inpaintMode.value
+        run_combined_mode = self._is_combined_mode(run_mode)
         run_video_bitrate_mbps = float(config.videoOutputBitrateMbps.value)
         run_moving_watermark_fast_mode = bool(config.movingWatermarkFastMode.value)
         run_propainter_max_load_num = int(config.propainterMaxLoadNum.value)
@@ -1705,7 +2038,26 @@ class HomeInterface(QWidget):
         if not pending_tasks:
             self.append_output(tr['SubtitleExtractorGUI']['OpenVideoFirst'])
             return
-        if run_mode == InpaintMode.FIXED_WATERMARK:
+        if run_combined_mode:
+            default_subtitle_areas = self._subtitle_default_preview_areas()
+            missing_subtitle_selection = []
+            for index, task in pending_tasks:
+                if task.options.get(TaskOptions.SUB_AREAS.value):
+                    continue
+                if default_subtitle_areas:
+                    self.task_list_component.update_task_option(
+                        index, TaskOptions.SUB_AREAS, list(default_subtitle_areas)
+                    )
+                    self.task_list_component.update_task_option(
+                        index, TaskOptions.SUB_AREAS_SOURCE, "default"
+                    )
+                elif not config.autoSubtitleAreaSelection.value:
+                    missing_subtitle_selection.append((index, task))
+            if missing_subtitle_selection:
+                self.task_list_component.select_task(missing_subtitle_selection[0][0])
+                self.append_output(tr['Main']['CombinedSubtitleAreaRequired'])
+                return
+        if uses_fixed_watermark(run_mode):
             missing_selection = [
                 (index, task)
                 for index, task in pending_tasks
@@ -1715,9 +2067,14 @@ class HomeInterface(QWidget):
             ]
             if missing_selection:
                 self.task_list_component.select_task(missing_selection[0][0])
-                self.append_output(tr['Main']['FixedWatermarkAreaRequired'])
+                message_key = (
+                    'CombinedFixedWatermarkAreaRequired'
+                    if run_combined_mode
+                    else 'FixedWatermarkAreaRequired'
+                )
+                self.append_output(tr['Main'][message_key])
                 return
-        if run_mode == InpaintMode.MOVING_WATERMARK:
+        if uses_moving_watermark(run_mode):
             invalid_template = [
                 (index, task)
                 for index, task in pending_tasks
@@ -1725,7 +2082,12 @@ class HomeInterface(QWidget):
             ]
             if invalid_template:
                 self.task_list_component.select_task(invalid_template[0][0])
-                self.append_output(tr['Main']['MovingWatermarkTemplateRequired'])
+                message_key = (
+                    'CombinedMovingWatermarkTemplateRequired'
+                    if run_combined_mode
+                    else 'MovingWatermarkTemplateRequired'
+                )
+                self.append_output(tr['Main'][message_key])
                 return
 
         try:
@@ -1739,7 +2101,7 @@ class HomeInterface(QWidget):
             self._is_processing = True
             self.setting_interface.set_inpaint_mode_enabled(False)
             self.toggle_buttons_signal.emit(False)
-            if run_mode == InpaintMode.MOVING_WATERMARK:
+            if uses_moving_watermark(run_mode):
                 # Schedule the first task as well.  This lets repeated runs hit
                 # the validated on-disk artifact and overlaps worker startup
                 # with the initial CPU scan.
@@ -1749,7 +2111,7 @@ class HomeInterface(QWidget):
                 try:
                     self.append_log_signal.emit(["初始化处理引擎..."])
                     self._ensure_subtitle_worker()
-                    if not self._is_watermark_mode(run_mode):
+                    if uses_subtitles(run_mode):
                         self._schedule_pending_auto_area_detections()
                         self._schedule_pending_subtitle_interval_detections()
                     while not self._stop_event.is_set():
@@ -1757,7 +2119,7 @@ class HomeInterface(QWidget):
                             pending_tasks = self.task_list_component.get_pending_tasks()
                             if not pending_tasks:
                                 break
-                            if not self._is_watermark_mode(run_mode):
+                            if uses_subtitles(run_mode):
                                 self._schedule_pending_auto_area_detections()
                                 self._schedule_pending_subtitle_interval_detections()
                             current_batch_id = pending_tasks[0][1].batch_id
@@ -1786,19 +2148,39 @@ class HomeInterface(QWidget):
                             tracking_reference_frame_no = None
                             tracking_template_area = None
                             tracking_template_source_path = None
-                            # Watermark modes use normalized video coordinates and
-                            # do not depend on mutable preview-widget geometry.
-                            if run_mode == InpaintMode.FIXED_WATERMARK:
+                            subtitle_areas_video = []
+                            watermark_areas_video = []
+
+                            if uses_subtitles(run_mode):
+                                subtitle_areas = self.ensure_subtitle_areas_before_run(
+                                    self.current_processing_task_index,
+                                    task_item.path,
+                                    run_mode,
+                                )
+                                subtitle_areas_video = self.video_display_component.preview_coordinates_to_video_coordinates(
+                                    subtitle_areas
+                                )
+                                if run_combined_mode and not subtitle_areas_video:
+                                    raise ValueError(tr['Main']['CombinedSubtitleAreaRequired'])
+
+                            # Watermark task options are stored in normalized video
+                            # coordinates so they stay independent of preview geometry.
+                            if uses_fixed_watermark(run_mode):
                                 normalized_areas = task_item.options.get(
                                     TaskOptions.FIXED_WATERMARK_AREAS.value, []
                                 )
-                                subtitle_areas_video = self._normalized_areas_to_video_coordinates(
+                                watermark_areas_video = self._normalized_areas_to_video_coordinates(
                                     normalized_areas,
                                     self._get_video_dimensions(task_item.path),
                                 )
-                                if not subtitle_areas_video:
-                                    raise ValueError(tr['Main']['FixedWatermarkAreaRequired'])
-                            elif run_mode == InpaintMode.MOVING_WATERMARK:
+                                if not watermark_areas_video:
+                                    message_key = (
+                                        'CombinedFixedWatermarkAreaRequired'
+                                        if run_combined_mode
+                                        else 'FixedWatermarkAreaRequired'
+                                    )
+                                    raise ValueError(tr['Main'][message_key])
+                            elif uses_moving_watermark(run_mode):
                                 (
                                     tracking_template_area,
                                     tracking_reference_frame_no,
@@ -1806,33 +2188,35 @@ class HomeInterface(QWidget):
                                 ) = self._moving_watermark_template_for_task(
                                     self.current_processing_task_index
                                 )
-                                subtitle_areas_video = self._normalized_areas_to_video_coordinates(
+                                watermark_areas_video = self._normalized_areas_to_video_coordinates(
                                     [tracking_template_area] if tracking_template_area is not None else [],
                                     self._get_video_dimensions(task_item.path),
                                 )
                                 if (
-                                    len(subtitle_areas_video) != 1
+                                    len(watermark_areas_video) != 1
                                     or tracking_reference_frame_no is None
                                 ):
-                                    raise ValueError(tr['Main']['MovingWatermarkTemplateRequired'])
+                                    message_key = (
+                                        'CombinedMovingWatermarkTemplateRequired'
+                                        if run_combined_mode
+                                        else 'MovingWatermarkTemplateRequired'
+                                    )
+                                    raise ValueError(tr['Main'][message_key])
                                 tracking_template_source_path = (
                                     tracking_template_source_path or task_item.path
                                 )
-                            else:
-                                subtitle_areas = self.ensure_subtitle_areas_before_run(
+                            subtitle_intervals = (
+                                self.ensure_subtitle_intervals_before_run(
                                     self.current_processing_task_index,
                                     task_item.path,
+                                    subtitle_areas_video,
                                     run_mode,
                                 )
-                                subtitle_areas_video = self.video_display_component.preview_coordinates_to_video_coordinates(subtitle_areas)
-                            subtitle_intervals = self.ensure_subtitle_intervals_before_run(
-                                self.current_processing_task_index,
-                                task_item.path,
-                                subtitle_areas_video,
-                                run_mode,
+                                if uses_subtitles(run_mode)
+                                else None
                             )
 
-                            if not self._is_watermark_mode(run_mode):
+                            if uses_subtitles(run_mode) and not run_combined_mode:
                                 self.video_display_component.save_selections_to_config()
 
                             # 更新任务状态为运行中
@@ -1852,20 +2236,22 @@ class HomeInterface(QWidget):
                                 if key in (
                                     TaskOptions.SUB_AREAS_SOURCE.value,
                                     TaskOptions.SUB_AREAS.value,
+                                    TaskOptions.SUBTITLE_INTERVALS.value,
                                     TaskOptions.FIXED_WATERMARK_AREAS.value,
                                     TaskOptions.MOVING_WATERMARK_TEMPLATE_AREA.value,
                                     TaskOptions.MOVING_WATERMARK_REFERENCE_FRAME_NO.value,
                                     TaskOptions.MOVING_WATERMARK_TEMPLATE_SOURCE_PATH.value,
                                 ):
                                     continue
-                                if (
-                                    self._is_watermark_mode(run_mode)
-                                    and key == TaskOptions.SUBTITLE_INTERVALS.value
-                                ):
-                                    continue
                                 options[key] = task_item.options[key]
-                            options[TaskOptions.SUB_AREAS.value] = subtitle_areas_video
-                            if run_mode == InpaintMode.MOVING_WATERMARK:
+                            options[TaskOptions.SUB_AREAS.value] = (
+                                subtitle_areas_video
+                                if uses_subtitles(run_mode)
+                                else watermark_areas_video
+                            )
+                            if uses_fixed_watermark(run_mode) or uses_moving_watermark(run_mode):
+                                options["watermark_areas"] = watermark_areas_video
+                            if uses_moving_watermark(run_mode):
                                 options["tracking_reference_frame_no"] = tracking_reference_frame_no
                                 options["tracking_template_area"] = tracking_template_area
                                 options["tracking_template_source_path"] = tracking_template_source_path
@@ -2225,9 +2611,8 @@ class HomeInterface(QWidget):
         if self._saved_inpaint_mode is not None:
             config.set(config.inpaintMode, self._saved_inpaint_mode)
             self._saved_inpaint_mode = None
-        self.setting_interface.set_inpaint_mode_enabled(not self._is_processing)
+        self._refresh_interaction_controls()
         self.video_slider.setValue(1)
-        self.video_display_component.set_dragger_enabled(not self._is_processing)
         return True
 
 
@@ -2380,6 +2765,7 @@ class HomeInterface(QWidget):
         """窗口关闭时断开信号连接并清理资源"""
         try:
             # 通知 worker 线程停止
+            self._invalidate_auto_area_request()
             self._stop_event.set()
             self._cancel_moving_preprocessing()
             # 终止子进程

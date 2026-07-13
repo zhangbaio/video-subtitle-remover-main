@@ -23,6 +23,12 @@ class VideoDisplayComponent(QWidget):
         self.selection_rect = (0, 0, 0, 0)  # 当前正在绘制或调整的选区 (ymin, ymax, xmin, xmax)
         self.selection_rects = []  # 存储多个选区，每个元素为 (ymin, ymax, xmin, xmax)
         self.active_selection_index = -1  # 当前活动选区的索引
+        # 联合模式下，当前编辑层之外的选区只作为只读叠加层显示。
+        # 默认颜色保持旧模式原有的绿色/黄色样式。
+        self.overlay_selection_rects = []
+        self.selection_active_color = QtGui.QColor(0, 255, 0)
+        self.selection_inactive_color = QtGui.QColor(255, 255, 0)
+        self.overlay_selection_color = QtGui.QColor(255, 140, 0)
         self.drag_start_pos = None
         self.resize_edge = None
         self.edge_size = 10  # 调整大小的边缘区域
@@ -279,14 +285,28 @@ class VideoDisplayComponent(QWidget):
             scale_y = pixmap_size.height() / display_size.height()
             video_display_width = self.video_display.width()
             video_display_height = self.video_display.height()
+
+            # 联合模式的另一编辑层使用虚线绘制，不能被拖拽或删除。
+            overlay_pen = QtGui.QPen(self.overlay_selection_color)
+            overlay_pen.setWidth(2)
+            overlay_pen.setStyle(Qt.DashLine)
+            painter.setPen(overlay_pen)
+            for rect in self.overlay_selection_rects:
+                ymin, ymax, xmin, xmax = rect
+                pixel_rect = QRect(
+                    int(xmin * scale_x * video_display_width),
+                    int(ymin * scale_y * video_display_height),
+                    int((xmax - xmin) * scale_x * video_display_width),
+                    int((ymax - ymin) * scale_y * video_display_height)
+                )
+                painter.drawRect(pixel_rect)
+
             for i, rect in enumerate(self.selection_rects):
                 # 设置选择框样式
                 if i == self.active_selection_index:
-                    # 活动选区使用绿色
-                    pen = QtGui.QPen(QtGui.QColor(0, 255, 0))
+                    pen = QtGui.QPen(self.selection_active_color)
                 else:
-                    # 非活动选区使用黄色
-                    pen = QtGui.QPen(QtGui.QColor(255, 255, 0))
+                    pen = QtGui.QPen(self.selection_inactive_color)
                 pen.setWidth(2)
                 painter.setPen(pen)
                 
@@ -304,7 +324,7 @@ class VideoDisplayComponent(QWidget):
             
             # 如果正在绘制新选区，也绘制它
             if self.is_drawing and any(self.selection_rect):
-                pen = QtGui.QPen(QtGui.QColor(0, 255, 0))  # 绿色
+                pen = QtGui.QPen(self.selection_active_color)
                 pen.setWidth(2)
                 painter.setPen(pen)
                 
@@ -727,9 +747,32 @@ class VideoDisplayComponent(QWidget):
     
     def set_selection_rects(self, rects):
         """设置选择框"""
-        self.selection_rects = rects
-        self.selection_rect = rects[-1] if rects else QRect()
-        self.active_selection_index = len(rects) - 1
+        self.selection_rects = list(rects or [])
+        self.selection_rect = self.selection_rects[-1] if self.selection_rects else QRect()
+        self.active_selection_index = len(self.selection_rects) - 1
+        self.update_preview_with_rect()
+
+    def set_selection_overlay(self, rects, color=None):
+        """Set a read-only overlay layer used by combined subtitle/watermark modes."""
+        self.overlay_selection_rects = list(rects or [])
+        if color is not None:
+            self.overlay_selection_color = QtGui.QColor(color)
+        self.update_preview_with_rect()
+
+    def set_selection_colors(self, active_color=None, inactive_color=None):
+        """Set colors for the editable selection layer."""
+        if active_color is not None:
+            self.selection_active_color = QtGui.QColor(active_color)
+        if inactive_color is not None:
+            self.selection_inactive_color = QtGui.QColor(inactive_color)
+        self.update_preview_with_rect()
+
+    def reset_selection_layers(self):
+        """Restore legacy selection colors and remove the combined-mode overlay."""
+        self.overlay_selection_rects = []
+        self.selection_active_color = QtGui.QColor(0, 255, 0)
+        self.selection_inactive_color = QtGui.QColor(255, 255, 0)
+        self.overlay_selection_color = QtGui.QColor(255, 140, 0)
         self.update_preview_with_rect()
     
     def load_selections_from_config(self, config_item=None):

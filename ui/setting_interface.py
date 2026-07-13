@@ -92,6 +92,23 @@ class SettingInterface(QtWidgets.QVBoxLayout):
         self.subtitle_detect_model_combo.setEnabled(enabled)
         self.auto_subtitle_area_selection.setEnabled(enabled)
 
+    def set_batch_controls_enabled(
+        self,
+        enabled,
+        *,
+        mode_enabled=True,
+        subtitle_enabled=True,
+        moving_enabled=True,
+    ):
+        """Lock every setting that can change an active batch's behavior."""
+        self.inpaint_mode_combo.comboBox.setEnabled(enabled and mode_enabled)
+        self.subtitle_detect_model_combo.setEnabled(enabled and subtitle_enabled)
+        self.auto_subtitle_area_selection.setEnabled(enabled and subtitle_enabled)
+        self.hardware_acceleration.setEnabled(
+            enabled and HARDWARD_ACCELERATION_OPTION
+        )
+        self.moving_watermark_fast_mode.setEnabled(enabled and moving_enabled)
+
     def reset_setting(self):
         """重置所有设置为默认值"""
         # 这里需要实现重置逻辑
