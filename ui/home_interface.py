@@ -1,11 +1,13 @@
 import os
 import cv2
 import math
+import re
 import threading
 import multiprocessing
 import tempfile
 import time
 import traceback
+import unicodedata
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from collections import Counter
 from PySide6.QtWidgets import QWidget, QHBoxLayout, QVBoxLayout
@@ -32,6 +34,78 @@ WATERMARK_INPAINT_MODES = frozenset((
     InpaintMode.FIXED_WATERMARK,
     InpaintMode.MOVING_WATERMARK,
 ))
+
+_CHINESE_DIGITS = {
+    "零": 0,
+    "〇": 0,
+    "一": 1,
+    "二": 2,
+    "两": 2,
+    "三": 3,
+    "四": 4,
+    "五": 5,
+    "六": 6,
+    "七": 7,
+    "八": 8,
+    "九": 9,
+}
+_CHINESE_SMALL_UNITS = {"十": 10, "百": 100, "千": 1000}
+_CHINESE_LARGE_UNITS = {"万": 10_000, "亿": 100_000_000}
+_CHINESE_EPISODE_PATTERN = re.compile(
+    r"第\s*([零〇一二两三四五六七八九十百千万亿]+)\s*([集话話回期章])"
+)
+_NATURAL_NUMBER_PATTERN = re.compile(r"(\d+)")
+
+
+def _chinese_number_to_int(text):
+    """Convert common Chinese episode numerals to an integer."""
+    if not text:
+        return None
+    if not any(char in _CHINESE_SMALL_UNITS or char in _CHINESE_LARGE_UNITS for char in text):
+        try:
+            return int("".join(str(_CHINESE_DIGITS[char]) for char in text))
+        except (KeyError, ValueError):
+            return None
+
+    total = 0
+    section = 0
+    number = 0
+    for char in text:
+        if char in _CHINESE_DIGITS:
+            number = _CHINESE_DIGITS[char]
+            continue
+        if char in _CHINESE_SMALL_UNITS:
+            section += (number or 1) * _CHINESE_SMALL_UNITS[char]
+            number = 0
+            continue
+        if char in _CHINESE_LARGE_UNITS:
+            section = (section + number) * _CHINESE_LARGE_UNITS[char]
+            total += section
+            section = 0
+            number = 0
+            continue
+        return None
+    return total + section + number
+
+
+def _episode_name_sort_key(path):
+    """Return a deterministic natural key for Arabic and Chinese episode names."""
+    basename = os.path.basename(os.fspath(path))
+    normalized = unicodedata.normalize("NFKC", basename).casefold()
+
+    def replace_chinese_episode(match):
+        episode_number = _chinese_number_to_int(match.group(1))
+        if episode_number is None:
+            return match.group(0)
+        return f"第{episode_number}{match.group(2)}"
+
+    normalized = _CHINESE_EPISODE_PATTERN.sub(replace_chinese_episode, normalized)
+    natural_parts = tuple(
+        (0, int(part), len(part)) if part.isdigit() else (1, part, 0)
+        for part in _NATURAL_NUMBER_PATTERN.split(normalized)
+        if part
+    )
+    return natural_parts, normalized, basename
 
 
 class BatchFolderManagerDialog(QtWidgets.QDialog):
@@ -2132,7 +2206,7 @@ class HomeInterface(QWidget):
             if stem.endswith("_no_sub"):
                 continue
             files.append(path)
-        return sorted(files, key=lambda path: os.path.basename(path).lower())
+        return sorted(files, key=_episode_name_sort_key)
 
     def open_folders_batch(self):
         output_root = config.saveDirectory.value or ""
