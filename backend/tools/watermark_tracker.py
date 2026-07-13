@@ -13,6 +13,7 @@ from backend.scenedetect.detectors import ContentDetector
 from backend.scenedetect.scene_manager import compute_downscale_factor
 from backend.tools.common_tools import get_readable_path
 from backend.tools.ffmpeg_cli import FFmpegCLI
+from backend.tools.video_io import FramePrefetcher
 
 
 MOVING_WATERMARK_PREPROCESS_SCHEMA = 1
@@ -578,11 +579,14 @@ def preprocess_moving_watermark(
     scores = []
     frame_no = 0
     was_active = False
+    frame_bytes = max(1, height * width * 3)
+    prefetch_frames = max(1, min(12, (128 * 1024 * 1024) // frame_bytes))
+    reader = FramePrefetcher(cap, buffer_size=prefetch_frames)
     try:
         while True:
             if cancel_event is not None and cancel_event.is_set():
                 raise RuntimeError("Moving watermark preprocessing cancelled")
-            ok, frame = cap.read()
+            ok, frame = reader.read()
             if not ok:
                 break
             scene_frame = frame
@@ -616,7 +620,7 @@ def preprocess_moving_watermark(
             was_active = True
             frame_no += 1
     finally:
-        cap.release()
+        reader.release()
 
     if expected_count and frame_no != expected_count:
         raise ValueError(

@@ -352,6 +352,15 @@ class TaskListComponent(QWidget):
                 self.current_task_index = -1
             self.task_deleted.emit(row)
 
+    def clear_tasks(self):
+        """Remove every imported task and reset the table selection."""
+        cleared_count = len(self.tasks)
+        self.tasks.clear()
+        self.current_task_index = -1
+        self.table.clearSelection()
+        self.table.setRowCount(0)
+        return cleared_count
+
     def on_task_clicked(self, index):
         row = index.row()
         if 0 <= row < len(self.tasks):

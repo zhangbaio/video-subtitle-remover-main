@@ -1,6 +1,7 @@
 import os
 import queue
 import subprocess
+import tempfile
 import threading
 from functools import lru_cache
 
@@ -231,8 +232,10 @@ class FFmpegVideoWriter:
         except Exception:
             return False
 
-    def __init__(self, output_path, fps, size):
+    def __init__(self, output_path, fps, size, bitrate_mbps=4.5):
         w, h = size
+        bitrate_mbps = max(0.1, float(bitrate_mbps))
+        bitrate = f'{bitrate_mbps:g}M'
         ffmpeg_path = FFmpegCLI.instance().ffmpeg_path
         prefer_nvenc = (
             HardwareAccelerator.instance().has_cuda()
@@ -254,47 +257,134 @@ class FFmpegVideoWriter:
             cmd.extend([
                 '-c:v', 'h264_nvenc',
                 '-preset', 'p4',
-                '-rc', 'vbr',
-                '-cq', '19',
-                '-b:v', '0',
+                '-rc', 'cbr',
+                '-b:v', bitrate,
+                '-minrate', bitrate,
+                '-maxrate', bitrate,
+                '-bufsize', bitrate,
                 '-pix_fmt', 'yuv420p',
             ])
         else:
             cmd.extend([
                 '-c:v', 'libx264',
-                '-pix_fmt', 'yuv420p',
-                '-crf', '18',
                 '-preset', 'fast',
+                '-b:v', bitrate,
+                '-minrate', bitrate,
+                '-maxrate', bitrate,
+                '-bufsize', bitrate,
+                '-x264-params', 'nal-hrd=cbr:force-cfr=1',
+                '-pix_fmt', 'yuv420p',
             ])
 
         cmd.extend([
             '-loglevel', 'error',
             output_path
         ])
-        self._process = subprocess.Popen(
-            cmd,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
+        self._output_path = output_path
+        self._frame_shape = (int(h), int(w), 3)
+        self._released = False
+        # A real file cannot fill up and block FFmpeg like an unread stderr
+        # pipe, but still preserves diagnostics if the encoder fails.
+        self._stderr_file = tempfile.TemporaryFile(mode='w+b')
+        try:
+            self._process = subprocess.Popen(
+                cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=self._stderr_file,
+            )
+        except BaseException:
+            self._stderr_file.close()
+            raise
+
+    def _read_stderr(self, limit=16384):
+        if self._stderr_file.closed:
+            return ''
+        try:
+            self._stderr_file.flush()
+            self._stderr_file.seek(0, os.SEEK_END)
+            size = self._stderr_file.tell()
+            offset = max(0, size - limit)
+            self._stderr_file.seek(offset)
+            message = self._stderr_file.read(limit).decode('utf-8', errors='replace').strip()
+            if offset:
+                message = f'...{message}'
+            return message
+        except OSError:
+            return ''
+
+    def _ffmpeg_error(self, action):
+        returncode = self._process.poll()
+        status = '' if returncode is None else f' (exit code {returncode})'
+        message = f'FFmpeg video writer {action}{status}: {self._output_path}'
+        stderr = self._read_stderr()
+        if stderr:
+            message = f'{message}\n{stderr}'
+        return RuntimeError(message)
 
     def write(self, frame):
         """写入一帧（numpy BGR 数组）。"""
+        if self._released:
+            raise RuntimeError('Cannot write to a released FFmpeg video writer')
+        if frame.shape != self._frame_shape:
+            raise ValueError(
+                f'Expected a BGR frame with shape {self._frame_shape}, got {frame.shape}'
+            )
         if frame.dtype != np.uint8:
             frame = np.clip(frame, 0, 255).astype(np.uint8)
+        if not frame.flags.c_contiguous:
+            frame = np.ascontiguousarray(frame)
+
+        if self._process.poll() is not None:
+            raise self._ffmpeg_error('exited before accepting a frame')
+        stdin = self._process.stdin
+        if stdin is None or stdin.closed:
+            raise self._ffmpeg_error('has no writable input pipe')
+
+        # Passing the contiguous buffer directly avoids frame.tobytes(), which
+        # otherwise allocates and copies the complete frame before every write.
+        remaining = memoryview(frame).cast('B')
         try:
-            self._process.stdin.write(frame.tobytes())
-        except BrokenPipeError:
-            pass
+            while remaining:
+                written = stdin.write(remaining)
+                if not written:
+                    raise BrokenPipeError('FFmpeg input pipe accepted zero bytes')
+                remaining = remaining[written:]
+        except (BrokenPipeError, OSError, ValueError) as error:
+            try:
+                self._process.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                pass
+            raise self._ffmpeg_error('failed while writing a frame') from error
 
     def release(self):
         """关闭管道并等待编码完成。"""
+        if self._released:
+            return
+        self._released = True
+        close_error = None
         try:
-            self._process.stdin.close()
-        except BrokenPipeError:
-            pass
-        try:
-            self._process.wait(timeout=600)
-        except subprocess.TimeoutExpired:
-            self._process.terminate()
-            self._process.wait(timeout=5)
+            stdin = self._process.stdin
+            if stdin is not None and not stdin.closed:
+                try:
+                    stdin.close()
+                except (BrokenPipeError, OSError, ValueError) as error:
+                    close_error = error
+
+            try:
+                returncode = self._process.wait(timeout=600)
+            except subprocess.TimeoutExpired as error:
+                self._process.terminate()
+                try:
+                    self._process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    self._process.kill()
+                    self._process.wait(timeout=5)
+                raise self._ffmpeg_error('timed out while finalizing') from error
+
+            if returncode != 0:
+                raise self._ffmpeg_error('failed while finalizing')
+            if close_error is not None:
+                raise self._ffmpeg_error('failed to close its input pipe') from close_error
+        finally:
+            self._stderr_file.close()

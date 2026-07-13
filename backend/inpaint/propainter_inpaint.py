@@ -3,28 +3,69 @@ import os
 import gc
 import cv2
 import numpy as np
-import scipy.ndimage
 from PIL import Image
 from typing import List
 
 import torch
-import torchvision
 
-from backend import config
 from backend.inpaint.video.model.modules.flow_comp_raft import RAFT_bi
 from backend.inpaint.video.model.recurrent_flow_completion import RecurrentFlowCompleteNet
 from backend.inpaint.video.model.propainter import InpaintGenerator
-from backend.inpaint.video.core.utils import to_tensors
 from backend.inpaint.video.model.misc import get_device
 from backend.tools.inpaint_tools import (
     build_fixed_watermark_masks,
     get_fixed_watermark_rois,
     get_inpaint_area_by_mask,
 )
+from backend.tools.moving_mask import build_moving_watermark_mask_plan
 
 import warnings
 
 warnings.filterwarnings("ignore")
+
+
+_BINARY_DILATION_KERNEL = cv2.getStructuringElement(cv2.MORPH_CROSS, (3, 3))
+
+
+def _binary_dilate(mask, iterations):
+    """Match scipy.ndimage.binary_dilation's 2-D default connectivity."""
+    binary = np.ascontiguousarray(mask != 0, dtype=np.uint8)
+    return cv2.dilate(
+        binary,
+        _BINARY_DILATION_KERNEL,
+        iterations=iterations,
+        borderType=cv2.BORDER_CONSTANT,
+        borderValue=0,
+    )
+
+
+def _stack_uint8_images_to_tensor(images):
+    """Convert T x H x W [x C] uint8 images without a PIL round trip."""
+    stacked = images if isinstance(images, np.ndarray) else np.stack(images, axis=0)
+    stacked = np.ascontiguousarray(stacked)
+    tensor = torch.from_numpy(stacked)
+    if stacked.ndim == 3:
+        tensor = tensor.unsqueeze(1)
+    elif stacked.ndim == 4:
+        tensor = tensor.permute(0, 3, 1, 2)
+    else:
+        raise ValueError(f"Expected 2-D or 3-D images, got shape {stacked.shape}")
+    return tensor.contiguous().float().div(255)
+
+
+def _numpy_mask_to_luma(mask, force_uint8=False):
+    """Reproduce the existing NumPy -> PIL L conversion with a uint8 fast path."""
+    mask = np.asarray(mask)
+    if mask.ndim == 3 and mask.shape[2] == 1:
+        mask = mask.squeeze(2)
+    elif mask.ndim == 3 and mask.shape[2] == 3:
+        mask = cv2.cvtColor(mask, cv2.COLOR_BGR2GRAY)
+    if force_uint8:
+        mask = mask.astype(np.uint8)
+    if mask.ndim == 2 and mask.dtype == np.uint8:
+        return np.ascontiguousarray(mask)
+    return np.array(Image.fromarray(mask).convert('L'))
+
 
 def binary_mask(mask, th=0.1):
     mask[mask > th] = 1
@@ -33,7 +74,7 @@ def binary_mask(mask, th=0.1):
 
 
 # read frame-wise masks
-def read_mask(mpath, length, size, flow_mask_dilates=8, mask_dilates=5):
+def read_mask(mpath, length, size, flow_mask_dilates=8, mask_dilates=5, as_numpy=False):
     masks_img = []
     masks_dilated = []
     flow_masks = []
@@ -44,7 +85,7 @@ def read_mask(mpath, length, size, flow_mask_dilates=8, mask_dilates=5):
         elif mpath.ndim == 3 and mpath.shape[2] == 3:
             # 如果是彩色图像，转为灰度
             mpath = cv2.cvtColor(mpath, cv2.COLOR_BGR2GRAY)
-        masks_img = [Image.fromarray(mpath)]
+        masks_img = [_numpy_mask_to_luma(mpath)]
     elif isinstance(mpath, (list, tuple)):
         for item in mpath:
             if isinstance(item, Image.Image):
@@ -55,7 +96,7 @@ def read_mask(mpath, length, size, flow_mask_dilates=8, mask_dilates=5):
                 item = item.squeeze(2)
             elif item.ndim == 3 and item.shape[2] == 3:
                 item = cv2.cvtColor(item, cv2.COLOR_BGR2GRAY)
-            masks_img.append(Image.fromarray(item.astype(np.uint8)))
+            masks_img.append(_numpy_mask_to_luma(item, force_uint8=True))
     # input single img path
     else:
         if isinstance(mpath, str):
@@ -67,23 +108,32 @@ def read_mask(mpath, length, size, flow_mask_dilates=8, mask_dilates=5):
                 masks_img.append(Image.open(os.path.join(mpath, mp)))
 
     for mask_img in masks_img:
-        mask_img = np.array(mask_img.convert('L'))
+        if isinstance(mask_img, Image.Image):
+            mask_img = np.array(mask_img.convert('L'))
 
-        # Dilate 8 pixel so that all known pixel is trustworthy
-        if flow_mask_dilates > 0:
-            flow_mask_img = scipy.ndimage.binary_dilation(mask_img, iterations=flow_mask_dilates).astype(np.uint8)
+        # OpenCV's 3x3 cross is pixel-equivalent to scipy's default 2-D
+        # binary_dilation structure, while avoiding scipy's per-call overhead.
+        if flow_mask_dilates == mask_dilates:
+            if flow_mask_dilates > 0:
+                flow_mask_img = _binary_dilate(mask_img, flow_mask_dilates)
+            else:
+                flow_mask_img = (mask_img != 0).astype(np.uint8)
+            mask_img = flow_mask_img
         else:
-            flow_mask_img = binary_mask(mask_img).astype(np.uint8)
+            if flow_mask_dilates > 0:
+                flow_mask_img = _binary_dilate(mask_img, flow_mask_dilates)
+            else:
+                flow_mask_img = (mask_img != 0).astype(np.uint8)
+
+            if mask_dilates > 0:
+                mask_img = _binary_dilate(mask_img, mask_dilates)
+            else:
+                mask_img = (mask_img != 0).astype(np.uint8)
         # Close the small holes inside the foreground objects
         # flow_mask_img = cv2.morphologyEx(flow_mask_img, cv2.MORPH_CLOSE, np.ones((21, 21),np.uint8)).astype(bool)
         # flow_mask_img = scipy.ndimage.binary_fill_holes(flow_mask_img).astype(np.uint8)
-        flow_masks.append(Image.fromarray(flow_mask_img * 255))
-
-        if mask_dilates > 0:
-            mask_img = scipy.ndimage.binary_dilation(mask_img, iterations=mask_dilates).astype(np.uint8)
-        else:
-            mask_img = binary_mask(mask_img).astype(np.uint8)
-        masks_dilated.append(Image.fromarray(mask_img * 255))
+        flow_masks.append(flow_mask_img * 255)
+        masks_dilated.append(mask_img * 255)
 
     if len(masks_img) == 1:
         flow_masks = flow_masks * length
@@ -91,7 +141,13 @@ def read_mask(mpath, length, size, flow_mask_dilates=8, mask_dilates=5):
     elif len(masks_img) != length:
         raise ValueError(f"Expected {length} masks, got {len(masks_img)}")
 
-    return flow_masks, masks_dilated
+    if as_numpy:
+        return np.stack(flow_masks, axis=0), np.stack(masks_dilated, axis=0)
+
+    return (
+        [Image.fromarray(mask) for mask in flow_masks],
+        [Image.fromarray(mask) for mask in masks_dilated],
+    )
 
 
 def extrapolation(video_ori, scale):
@@ -204,23 +260,34 @@ class PropainterInpaint:
         model = model.to(self.device).eval()
         return model
 
+    @torch.inference_mode()
     def inpaint(self, frames, mask, clear_cuda_cache=True, raft_iter=None):
         if isinstance(frames[0], np.ndarray):
-            frames = [Image.fromarray(cv2.cvtColor(f, cv2.COLOR_BGR2RGB)) for f in frames]
-        size = frames[0].size
+            frames_inp = [cv2.cvtColor(f, cv2.COLOR_BGR2RGB) for f in frames]
+            frames_inp = [
+                frame if frame.dtype == np.uint8 else np.array(Image.fromarray(frame)).astype(np.uint8)
+                for frame in frames_inp
+            ]
+            size = (frames_inp[0].shape[1], frames_inp[0].shape[0])
+        else:
+            size = frames[0].size
+            frames_inp = [np.array(f).astype(np.uint8) for f in frames]
         frames_len = len(frames)
         flow_masks, masks_dilated = read_mask(mask, frames_len, size,
                                               flow_mask_dilates=self.mask_dilation,
-                                              mask_dilates=self.mask_dilation)
+                                              mask_dilates=self.mask_dilation,
+                                              as_numpy=True)
         w, h = size
-        frames_inp = [np.array(f).astype(np.uint8) for f in frames]
-        frames = to_tensors()(frames).unsqueeze(0) * 2 - 1
-        flow_masks = to_tensors()(flow_masks).unsqueeze(0)
-        masks_dilated = to_tensors()(masks_dilated).unsqueeze(0)
+        frames = _stack_uint8_images_to_tensor(frames_inp).unsqueeze(0) * 2 - 1
+        flow_masks = _stack_uint8_images_to_tensor(flow_masks).unsqueeze(0)
+        masks_dilated = _stack_uint8_images_to_tensor(masks_dilated).unsqueeze(0)
         frames, flow_masks, masks_dilated = frames.to(self.device), flow_masks.to(self.device), masks_dilated.to(
             self.device)
         video_length = frames.size(1)
         raft_iter = self.raft_iter if raft_iter is None else max(1, int(raft_iter))
+        # Fixed/moving-watermark batches pass ``False`` so CUDA's allocator can
+        # reuse memory between adjacent batches. Other callers keep the
+        # original conservative per-chunk cache release behavior.
         with torch.no_grad():
             # ---- compute flow ----
             if frames.size(-1) <= 640:
@@ -279,7 +346,6 @@ class PropainterInpaint:
                     pred_flows_b.append(pred_flows_bi_sub[1][:, pad_len_s:e_f - s_f - pad_len_e])
                     if clear_cuda_cache:
                         torch.cuda.empty_cache()
-
                 pred_flows_f = torch.cat(pred_flows_f, dim=1)
                 pred_flows_b = torch.cat(pred_flows_b, dim=1)
                 pred_flows_bi = (pred_flows_f, pred_flows_b)
@@ -314,7 +380,6 @@ class PropainterInpaint:
                     updated_masks.append(updated_masks_sub[:, pad_len_s:e_f - s_f - pad_len_e])
                     if clear_cuda_cache:
                         torch.cuda.empty_cache()
-
                 updated_frames = torch.cat(updated_frames, dim=1)
                 updated_masks = torch.cat(updated_masks, dim=1)
             else:
@@ -375,11 +440,12 @@ class PropainterInpaint:
     def inpaint_fixed_watermark(
         self,
         input_frames: List[np.ndarray],
-        selection_mask: np.ndarray,
+        selection_mask: np.ndarray = None,
         erase_margin=2,
         feather_radius=12,
         context=None,
         raft_iter=None,
+        moving_areas=None,
     ):
         """Inpaint a fixed selection with complete local context and soft edges.
 
@@ -390,8 +456,26 @@ class PropainterInpaint:
         if not input_frames:
             return []
 
-        dynamic_masks = isinstance(selection_mask, (list, tuple))
-        if dynamic_masks:
+        dynamic_masks = False
+        moving_mask_plan = None
+        if moving_areas is not None:
+            if selection_mask is not None:
+                raise ValueError("Pass either selection_mask or moving_areas, not both")
+            if len(moving_areas) != len(input_frames):
+                raise ValueError(
+                    f"Expected {len(input_frames)} moving-watermark areas, got {len(moving_areas)}"
+                )
+            moving_mask_plan = build_moving_watermark_mask_plan(
+                input_frames[0].shape[:2],
+                moving_areas,
+                erase_margin=erase_margin,
+                feather_radius=feather_radius,
+                context=context,
+                multiple=8,
+            )
+            rois = moving_mask_plan.rois
+        elif isinstance(selection_mask, (list, tuple)):
+            dynamic_masks = True
             if len(selection_mask) != len(input_frames):
                 raise ValueError(
                     f"Expected {len(input_frames)} fixed-watermark masks, got {len(selection_mask)}"
@@ -408,6 +492,11 @@ class PropainterInpaint:
                 erase_margin=erase_margin,
                 feather_radius=feather_radius,
             )
+            rois = get_fixed_watermark_rois(
+                union_outer_mask,
+                context=context,
+                multiple=8,
+            )
         else:
             layers = build_fixed_watermark_masks(
                 selection_mask,
@@ -418,12 +507,16 @@ class PropainterInpaint:
             outer_masks = [layers[1]] * len(input_frames)
             alpha_masks = [layers[2]] * len(input_frames)
             union_outer_mask = layers[1]
-        rois = get_fixed_watermark_rois(union_outer_mask, context=context, multiple=8)
+            rois = get_fixed_watermark_rois(
+                union_outer_mask,
+                context=context,
+                multiple=8,
+            )
         frames_hr = [frame.copy() for frame in input_frames]
         if not rois:
             return frames_hr
 
-        for ymin, ymax, xmin, xmax in rois:
+        for roi_index, (ymin, ymax, xmin, xmax) in enumerate(rois):
             crop_height = ymax - ymin
             crop_width = xmax - xmin
             if crop_height <= 0 or crop_width <= 0:
@@ -446,7 +539,10 @@ class PropainterInpaint:
                     )
                 cropped_frames.append(crop)
 
-            if dynamic_masks:
+            if moving_mask_plan is not None:
+                local_outer_masks = moving_mask_plan.outer_masks_by_roi[roi_index]
+                local_alpha_masks = moving_mask_plan.alpha_masks_by_roi[roi_index]
+            elif dynamic_masks:
                 local_layers = [
                     build_fixed_watermark_masks(
                         mask[ymin:ymax, xmin:xmax],
@@ -498,10 +594,6 @@ class PropainterInpaint:
             del cropped_frames, cropped_masks, completed_frames
             if dynamic_masks:
                 del local_layers, local_outer_masks, local_alpha_masks
-            gc.collect()
-
-        if getattr(self.device, "type", None) == "cuda":
-            torch.cuda.empty_cache()
         return frames_hr
 
     def __call__(self, input_frames: List[np.ndarray], input_mask: np.ndarray):

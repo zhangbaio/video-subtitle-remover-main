@@ -367,6 +367,8 @@ $RECYCLE.BIN/
 demo*.mp4
 out*.mp4
 test*.py
+!tests/test_moving_mask.py
+!tests/test_safe_optimizations.py
 test_*.mp4
 test*_no_sub*.mp4
 /test/coods/

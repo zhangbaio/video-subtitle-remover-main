@@ -60,8 +60,40 @@ def _device_cache_key(device):
         return f"{device_type}:{device_index}"
     return str(device)
 
+
+def _preferred_audio_stream_spec(video_path, input_index=1):
+    """Match FFmpeg's automatic audio choice: most channels, then first."""
+    fallback = f"{input_index}:a:0?"
+    try:
+        import av
+
+        with av.open(video_path) as container:
+            audio_streams = list(container.streams.audio)
+            if not audio_streams:
+                return fallback
+
+            def channel_count(stream):
+                codec_context = stream.codec_context
+                layout = getattr(codec_context, "layout", None)
+                layout_channels = getattr(layout, "channels", ()) if layout is not None else ()
+                try:
+                    return max(
+                        int(getattr(codec_context, "channels", 0) or 0),
+                        len(layout_channels or ()),
+                    )
+                except (TypeError, ValueError):
+                    return 0
+
+            selected = max(
+                audio_streams,
+                key=lambda stream: (channel_count(stream), -int(stream.index)),
+            )
+            return f"{input_index}:{int(selected.index)}?"
+    except Exception:
+        return fallback
+
 class SubtitleRemover:
-    def __init__(self, vd_path, gui_mode=False):
+    def __init__(self, vd_path, gui_mode=False, video_bitrate_mbps=None):
         # 线程锁
         self.lock = threading.RLock()
         # 用户指定的字幕区域位置
@@ -92,7 +124,16 @@ class SubtitleRemover:
         self.video_temp_file = tempfile.NamedTemporaryFile(suffix='.mp4', delete=False)
         # 创建视频写对象（使用 FFmpeg libx264 编码，比 mp4v 质量更好、文件更小）
         try:
-            self.video_writer = FFmpegVideoWriter(get_readable_path(self.video_temp_file.name), self.fps, self.size)
+            self.video_writer = FFmpegVideoWriter(
+                get_readable_path(self.video_temp_file.name),
+                self.fps,
+                self.size,
+                bitrate_mbps=(
+                    config.videoOutputBitrateMbps.value
+                    if video_bitrate_mbps is None
+                    else video_bitrate_mbps
+                ),
+            )
         except Exception:
             self.video_writer = cv2.VideoWriter(get_readable_path(self.video_temp_file.name), cv2.VideoWriter_fourcc(*'mp4v'), self.fps, self.size)
         self.video_out_path = os.path.abspath(os.path.join(os.path.dirname(self.video_path), f'{self.vd_name}_no_sub.mp4'))
@@ -119,6 +160,11 @@ class SubtitleRemover:
         self.tracking_template_area = None
         self.tracking_template_source_path = None
         self.moving_watermark_preprocess_path = None
+        # Snapshot performance-related options on the job instance.  The GUI
+        # worker process is intentionally long-lived, so reading the child
+        # process' global config here would make later UI changes ineffective.
+        self.moving_watermark_fast_mode = bool(config.movingWatermarkFastMode.value)
+        self.propainter_max_load_num = int(config.propainterMaxLoadNum.value)
         self.report_processing_phase = lambda *args: None
         self.preview_emit_interval = 0.2 if gui_mode else 0.0
         self._last_preview_emit_time = 0.0
@@ -179,9 +225,11 @@ class SubtitleRemover:
     def update_progress(self, tbar, increment):
         tbar.update(increment)
         current_percentage = (tbar.n / tbar.total) * 100
-        self.progress_remover = int(current_percentage)
-        self.progress_total = self.progress_remover
-        self.notify_progress_listeners()
+        progress = int(current_percentage)
+        self.progress_remover = progress
+        if progress != self.progress_total:
+            self.progress_total = progress
+            self.notify_progress_listeners()
 
     def append_output(self, *args):
         """输出信息到控制台
@@ -232,6 +280,10 @@ class SubtitleRemover:
         now = time.monotonic()
         if force or now - self._last_preview_emit_time >= self.preview_emit_interval:
             self._last_preview_emit_time = now
+            if callable(frame_ori):
+                frame_ori = frame_ori()
+            if callable(frame_comp):
+                frame_comp = frame_comp()
             self.update_preview_with_comp(frame_ori, frame_comp)
 
     def propainter_mode(self, tbar):
@@ -311,7 +363,7 @@ class SubtitleRemover:
                             # 将读取的视频帧分批处理
                             # 1. 获取当前批次使用的mask
                             mask = create_mask(self.mask_size, sub_list[start_frame_no])
-                            for batch in batch_generator(temp_frames, config.propainterMaxLoadNum.value):
+                            for batch in batch_generator(temp_frames, self.propainter_max_load_num):
                                 # 2. 调用批推理
                                 if len(batch) == 1:
                                     single_mask = create_mask(self.mask_size, sub_list[start_frame_no])
@@ -326,7 +378,14 @@ class SubtitleRemover:
                                         self.video_writer.write(inpainted_frame)
                                         # self.append_output(f'write frame: {start_frame_no + inner_index} with mask {sub_list[index]}')
                                         inner_index += 1
-                                        self.push_preview_with_comp(np.clip(batch[i]+mask[:,:,np.newaxis]*0.3,0,255).astype(np.uint8), inpainted_frame)
+                                        self.push_preview_with_comp(
+                                            lambda source=batch[i], preview_mask=mask: np.clip(
+                                                source + preview_mask[:, :, np.newaxis] * 0.3,
+                                                0,
+                                                255,
+                                            ).astype(np.uint8),
+                                            inpainted_frame,
+                                        )
                                 self.update_progress(tbar, increment=len(batch))
         reader.release()
 
@@ -356,10 +415,23 @@ class SubtitleRemover:
         blended = completed.astype(np.float32) * alpha + original.astype(np.float32) * (1.0 - alpha)
         return np.clip(blended, 0, 255).astype(np.uint8), outer_mask
 
-    def _inpaint_fixed_watermark_batch(self, frames, mask, fast=False):
+    def _inpaint_fixed_watermark_batch(
+        self,
+        frames,
+        mask=None,
+        fast=False,
+        moving_areas=None,
+    ):
         """Inpaint a contiguous frame batch while handling a one-frame tail."""
+        if moving_areas is not None and len(moving_areas) != len(frames):
+            raise ValueError(
+                f"Expected {len(frames)} moving-watermark areas, got {len(moving_areas)}"
+            )
         if len(frames) == 1:
-            frame_mask = mask[0] if isinstance(mask, (list, tuple)) else mask
+            if moving_areas is not None:
+                frame_mask = self._create_fixed_watermark_mask([moving_areas[0]])
+            else:
+                frame_mask = mask[0] if isinstance(mask, (list, tuple)) else mask
             _, outer_mask, _ = build_fixed_watermark_masks(frame_mask)
             rgb_frame = cv2.cvtColor(frames[0], cv2.COLOR_BGR2RGB)
             completed_rgb = self.lama_inpaint.inpaint(rgb_frame, outer_mask)
@@ -369,9 +441,10 @@ class SubtitleRemover:
         return self.propainter_inpaint_model.inpaint_fixed_watermark(
             frames,
             mask,
+            moving_areas=moving_areas,
             raft_iter=(
                 8
-                if fast and config.movingWatermarkFastMode.value
+                if fast and self.moving_watermark_fast_mode
                 else None
             ),
         )
@@ -384,7 +457,7 @@ class SubtitleRemover:
 
         self.append_output(tr['Main']['ProcessingStartRemovingFixedWatermark'])
         self.append_output(tr['Main']['FixedWatermarkStaticOnlyNote'])
-        max_batch_size = max(2, int(config.propainterMaxLoadNum.value))
+        max_batch_size = max(2, int(self.propainter_max_load_num))
         overlap = min(10, max(0, max_batch_size // 5))
         if max_batch_size - overlap < 2:
             overlap = 0
@@ -418,7 +491,10 @@ class SubtitleRemover:
                 inpainted_frame = inpainted_frames[index]
                 self.video_writer.write(inpainted_frame)
                 self.push_preview_with_comp(
-                    self._fixed_watermark_preview(frames[index], mask),
+                    lambda source=frames[index], preview_mask=mask: self._fixed_watermark_preview(
+                        source,
+                        preview_mask,
+                    ),
                     inpainted_frame,
                 )
             self.update_progress(tbar, increment=write_count)
@@ -666,8 +742,12 @@ class SubtitleRemover:
         )
         self.report_processing_phase("inpaint_started", self.video_path)
         self.append_output(tr['Main']['ProcessingStartRemovingMovingWatermark'])
+        self.append_output(
+            f"[Info] Moving-watermark RAFT iterations: "
+            f"{8 if self.moving_watermark_fast_mode else 20}"
+        )
 
-        max_batch_size = max(2, int(config.propainterMaxLoadNum.value))
+        max_batch_size = max(2, int(self.propainter_max_load_num))
         overlap = min(10, max(0, max_batch_size // 5))
         if max_batch_size - overlap < 2:
             overlap = 0
@@ -683,34 +763,34 @@ class SubtitleRemover:
         )
         reader = FramePrefetcher(read_cap)
         pending_frames = []
-        pending_masks = []
         pending_areas = []
 
         def write_processed_batch(keep_overlap=False):
-            nonlocal pending_frames, pending_masks, pending_areas
+            nonlocal pending_frames, pending_areas
             if not pending_frames:
                 return
             completed_frames = self._inpaint_fixed_watermark_batch(
                 pending_frames,
-                pending_masks,
                 fast=True,
+                moving_areas=pending_areas,
             )
             keep_count = overlap if keep_overlap and len(pending_frames) > overlap else 0
             write_count = len(pending_frames) - keep_count
             for index in range(write_count):
                 self.video_writer.write(completed_frames[index])
                 self.push_preview_with_comp(
-                    self._fixed_watermark_preview(pending_frames[index], pending_masks[index]),
+                    lambda source=pending_frames[index], area=pending_areas[index]: self._fixed_watermark_preview(
+                        source,
+                        self._create_fixed_watermark_mask([area]),
+                    ),
                     completed_frames[index],
                 )
             self.update_progress(tbar, increment=write_count)
             if keep_count:
                 pending_frames = pending_frames[write_count:]
-                pending_masks = pending_masks[write_count:]
                 pending_areas = pending_areas[write_count:]
             else:
                 pending_frames = []
-                pending_masks = []
                 pending_areas = []
 
         frame_no = 0
@@ -736,9 +816,7 @@ class SubtitleRemover:
 
                 if self._moving_batch_needs_flush(pending_areas, area):
                     write_processed_batch()
-                frame_mask = self._create_fixed_watermark_mask([area])
                 pending_frames.append(frame)
-                pending_masks.append(frame_mask)
                 pending_areas.append(area)
                 if len(pending_frames) >= max_batch_size:
                     write_processed_batch(keep_overlap=True)
@@ -860,11 +938,47 @@ class SubtitleRemover:
                             self.video_writer.write(inpainted_frame)
                             # self.append_output(f'write frame: {start_frame_index + inner_index} with mask')
                             inner_index += 1
-                            self.push_preview_with_comp(np.clip(batch[i]+mask[:,:,np.newaxis]*0.3,0,255).astype(np.uint8), inpainted_frame)
+                            self.push_preview_with_comp(
+                                lambda source=batch[i], preview_mask=mask: np.clip(
+                                    source + preview_mask[:, :, np.newaxis] * 0.3,
+                                    0,
+                                    255,
+                                ).astype(np.uint8),
+                                inpainted_frame,
+                            )
                     self.update_progress(tbar, increment=len(batch))
         reader.release()
 
     def run(self):
+        """Run one job and deterministically release per-job media resources."""
+        completed = False
+        try:
+            result = self._run_job()
+            completed = bool(self.isFinished)
+            return result
+        finally:
+            try:
+                self.video_cap.release()
+            except Exception:
+                pass
+            try:
+                self.video_writer.release()
+            except Exception:
+                # Preserve the original processing error. On an otherwise
+                # successful path, writer finalization failures must surface.
+                if completed:
+                    raise
+            try:
+                self.video_temp_file.close()
+            except Exception:
+                pass
+            try:
+                if os.path.exists(self.video_temp_file.name):
+                    os.remove(self.video_temp_file.name)
+            except OSError:
+                pass
+
+    def _run_job(self):
         # 记录开始时间
         start_time = time.time()
         if self.is_picture and config.inpaintMode.value == InpaintMode.MOVING_WATERMARK:
@@ -972,42 +1086,34 @@ class SubtitleRemover:
             self.append_output(tr['Main']['SubtitleDetectionModel'].format(f"{detect_mode_name}{providers_str}"))
 
     def merge_audio_to_video(self):
-        # 创建音频临时对象，windows下delete=True会有permission denied的报错
-        temp = tempfile.NamedTemporaryFile(suffix='.aac', delete=False)
-        audio_extract_command = [FFmpegCLI.instance().ffmpeg_path,
-                                 "-y", "-i", self.video_path,
-                                 "-acodec", "copy",
-                                 "-vn", "-loglevel", "error", temp.name]
-        use_shell = True if os.name == "nt" else False
+        """Mux the original audio without an intermediate AAC extraction."""
         try:
-            subprocess.check_output(audio_extract_command, stdin=open(os.devnull), shell=use_shell, timeout=600)
+            if not os.path.exists(self.video_temp_file.name):
+                raise FileNotFoundError(self.video_temp_file.name)
+            audio_merge_command = [
+                FFmpegCLI.instance().ffmpeg_path,
+                "-y",
+                "-i", self.video_temp_file.name,
+                "-i", self.video_path,
+                "-map", "0:v:0",
+                "-map", _preferred_audio_stream_spec(self.video_path),
+                "-c:v", "copy",
+                "-c:a", "copy",
+                "-loglevel", "error",
+                self.video_out_path,
+            ]
+            subprocess.check_output(
+                audio_merge_command,
+                stdin=subprocess.DEVNULL,
+                stderr=subprocess.STDOUT,
+                timeout=600,
+            )
         except Exception as e:
             traceback.print_exc()
-            self.append_output(tr['Main']['FailToExtractAudio'].format(str(e)))
-            return
+            self.append_output(tr['Main']['FailToMergeAudio'].format(str(e)))
         else:
-            if os.path.exists(self.video_temp_file.name):
-                audio_merge_command = [FFmpegCLI.instance().ffmpeg_path,
-                                       "-y", "-i", self.video_temp_file.name,
-                                       "-i", temp.name,
-                                       "-vcodec", "copy",
-                                       "-acodec", "copy",
-                                       "-loglevel", "error", self.video_out_path]
-                try:
-                    subprocess.check_output(audio_merge_command, stdin=open(os.devnull), shell=use_shell, timeout=600)
-                except Exception as e:
-                    traceback.print_exc()
-                    self.append_output(tr['Main']['FailToMergeAudio'].format(str(e)))
-                    return
-            if os.path.exists(temp.name):
-                try:
-                    os.remove(temp.name)
-                except Exception:
-                    #ignore
-                    pass
             self.is_successful_merged = True
         finally:
-            temp.close()
             if not self.is_successful_merged:
                 try:
                     shutil.copy2(self.video_temp_file.name, self.video_out_path)
@@ -1044,19 +1150,23 @@ class SubtitleRemover:
     @cached_property
     def propainter_inpaint_model(self):
         device = self.hardware_accelerator.device if self.hardware_accelerator.has_cuda() else torch.device("cpu")
+        max_load_num = max(1, int(self.propainter_max_load_num))
         cache_key = (
             _device_cache_key(device),
             self.model_config.PROPAINTER_MODEL_DIR,
-            config.propainterMaxLoadNum.value,
         )
         model = _PROPAINTER_INPAINT_CACHE.get(cache_key)
         if model is None:
             model = PropainterInpaint(
                 device,
                 self.model_config.PROPAINTER_MODEL_DIR,
-                config.propainterMaxLoadNum.value,
+                max_load_num,
             )
             _PROPAINTER_INPAINT_CACHE[cache_key] = model
+        else:
+            # Batch length changes inference chunking only; reuse the same
+            # weights instead of retaining a full model copy per setting.
+            model.sub_video_length = max_load_num
         return model
 
 

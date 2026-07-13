@@ -8,10 +8,46 @@ from qfluentwidgets import (ScrollArea, ExpandLayout, CardWidget, SubtitleLabel,
                            FluentIcon, NavigationWidget, NavigationItemPosition,
                            SettingCardGroup, RangeSettingCard, SwitchSettingCard,
                            HyperlinkCard, PrimaryPushSettingCard, PushSettingCard,
-                           MessageBox)
+                           MessageBox, SettingCard, DoubleSpinBox, qconfig)
 from backend.config import config, tr, VERSION, PROJECT_HOME_URL, PROJECT_ISSUES_URL, PROJECT_RELEASES_URL
 from backend.tools.version_service import VersionService
 from backend.tools.concurrent import TaskExecutor
+
+
+class BitrateSettingCard(SettingCard):
+    """Setting card for fractional Mbps values."""
+
+    valueChanged = QtCore.Signal(float)
+
+    def __init__(self, configItem, icon, title, content=None, parent=None):
+        super().__init__(icon, title, content, parent)
+        self.configItem = configItem
+        self.spin_box = DoubleSpinBox(self)
+        self.spin_box.setDecimals(1)
+        self.spin_box.setSingleStep(0.1)
+        self.spin_box.setRange(*configItem.range)
+        self.spin_box.setSuffix(" Mbps")
+        self.spin_box.setValue(float(configItem.value))
+        self.spin_box.setMinimumWidth(140)
+
+        self.hBoxLayout.addStretch(1)
+        self.hBoxLayout.addWidget(self.spin_box, 0, QtCore.Qt.AlignRight)
+        self.hBoxLayout.addSpacing(16)
+
+        configItem.valueChanged.connect(self.setValue)
+        self.spin_box.valueChanged.connect(self._on_value_changed)
+
+    def _on_value_changed(self, value):
+        value = round(float(value), 1)
+        qconfig.set(self.configItem, value)
+        self.valueChanged.emit(value)
+
+    def setValue(self, value):
+        value = float(value)
+        if self.spin_box.value() == value:
+            return
+        self.spin_box.setValue(value)
+
 
 class AdvancedSettingInterface(ScrollArea):
     """高级设置页面"""
@@ -59,6 +95,7 @@ class AdvancedSettingInterface(ScrollArea):
         self.propainter_group.addSettingCard(self.propainter_max_load_num)
         self.expandLayout.addWidget(self.propainter_group)
 
+        self.advanced_group.addSettingCard(self.video_output_bitrate)
         self.advanced_group.addSettingCard(self.save_directory)
         self.advanced_group.addSettingCard(self.check_update_on_startup)
         self.expandLayout.addWidget(self.advanced_group)
@@ -170,6 +207,14 @@ class AdvancedSettingInterface(ScrollArea):
             title=tr["Setting"]["PropainterMaxLoadNum"],
             content=tr["Setting"]["PropainterMaxLoadNumDesc"],
             parent=self.propainter_group
+        )
+
+        self.video_output_bitrate = BitrateSettingCard(
+            configItem=config.videoOutputBitrateMbps,
+            icon=FluentIcon.SPEED_HIGH,
+            title=tr["Setting"]["VideoOutputBitrate"],
+            content=tr["Setting"]["VideoOutputBitrateDesc"],
+            parent=self.advanced_group
         )
 
         # 视频保存路径

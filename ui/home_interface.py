@@ -292,7 +292,6 @@ class HomeInterface(QWidget):
         self._moving_preprocess_futures = {}
         self._moving_preprocess_results = {}
         self._moving_preprocess_errors = {}
-        self._moving_preprocess_artifacts = set()
         self._moving_preprocess_generation = 0
         self._moving_preprocess_cancel_event = threading.Event()
         self._active_run_mode = None
@@ -399,6 +398,11 @@ class HomeInterface(QWidget):
         self.batch_folder_button.setIcon(FluentIcon.FOLDER)
         self.batch_folder_button.clicked.connect(self.open_folders_batch)
         button_layout.addWidget(self.batch_folder_button)
+
+        self.clear_list_button = PushButton(tr['TaskList']['ClearList'], self)
+        self.clear_list_button.setIcon(FluentIcon.DELETE)
+        self.clear_list_button.clicked.connect(self.clear_task_list)
+        button_layout.addWidget(self.clear_list_button)
 
         self.auto_area_button = PushButton("自动框选", self)
         self.auto_area_button.setIcon(FluentIcon.SEARCH)
@@ -844,6 +848,19 @@ class HomeInterface(QWidget):
             # 如果还有任务，选中第一个
             self.task_list_component.select_task(0)
 
+    def clear_task_list(self):
+        """Clear imported tasks without deleting any source or output files."""
+        worker_is_stopping = self._worker_thread is not None and self._worker_thread.is_alive()
+        if self._is_processing or worker_is_stopping or self._auto_area_button_running:
+            return 0
+        cleared_count = self.task_list_component.clear_tasks()
+        self.current_processing_task_index = -1
+        self.current_processing_batch_id = None
+        self.current_processing_task_start_time = None
+        self.current_processing_run_start_time = None
+        self.se = None
+        return cleared_count
+
     def update_preview(self, frame):
         # 先缩放图像
         resized_frame = self._img_resize(frame)
@@ -1002,6 +1019,7 @@ class HomeInterface(QWidget):
         self.file_button.setEnabled(show_run)
         self.folder_button.setEnabled(show_run)
         self.batch_folder_button.setEnabled(show_run)
+        self.clear_list_button.setEnabled(show_run and not self._auto_area_button_running)
         self.auto_area_button.setEnabled(
             show_run
             and not self._auto_area_button_running
@@ -1015,6 +1033,7 @@ class HomeInterface(QWidget):
     def set_auto_area_button_running(self, running):
         self._auto_area_button_running = running
         watermark_mode = self._is_watermark_mode()
+        self.clear_list_button.setEnabled(not running and not self._is_processing)
         self.auto_area_button.setEnabled(not running and not watermark_mode)
         self.auto_area_button.setText("识别中..." if running else "自动框选")
 
@@ -1568,7 +1587,6 @@ class HomeInterface(QWidget):
                 **kwargs,
             )
             self._moving_preprocess_futures[artifact_key] = future
-            self._moving_preprocess_artifacts.add(request["path"])
 
         self.append_log_signal.emit([
             tr['Main']['MovingWatermarkPreprocessScheduled'].format(
@@ -1679,6 +1697,10 @@ class HomeInterface(QWidget):
 
     def run_button_clicked(self):
         run_mode = config.inpaintMode.value
+        run_video_bitrate_mbps = float(config.videoOutputBitrateMbps.value)
+        run_moving_watermark_fast_mode = bool(config.movingWatermarkFastMode.value)
+        run_propainter_max_load_num = int(config.propainterMaxLoadNum.value)
+        run_hardware_acceleration = bool(config.hardwareAcceleration.value)
         pending_tasks = self.task_list_component.get_pending_tasks()
         if not pending_tasks:
             self.append_output(tr['SubtitleExtractorGUI']['OpenVideoFirst'])
@@ -1717,6 +1739,11 @@ class HomeInterface(QWidget):
             self._is_processing = True
             self.setting_interface.set_inpaint_mode_enabled(False)
             self.toggle_buttons_signal.emit(False)
+            if run_mode == InpaintMode.MOVING_WATERMARK:
+                # Schedule the first task as well.  This lets repeated runs hit
+                # the validated on-disk artifact and overlaps worker startup
+                # with the initial CPU scan.
+                self._schedule_next_moving_watermark_preprocess(-1)
             # 开启后台线程处理视频
             def task():
                 try:
@@ -1851,6 +1878,10 @@ class HomeInterface(QWidget):
                             if subtitle_intervals is not None:
                                 options[TaskOptions.SUBTITLE_INTERVALS.value] = subtitle_intervals
                             options["inpaint_mode"] = run_mode
+                            options["video_bitrate_mbps"] = run_video_bitrate_mbps
+                            options["moving_watermark_fast_mode"] = run_moving_watermark_fast_mode
+                            options["propainter_max_load_num"] = run_propainter_max_load_num
+                            options["hardware_acceleration"] = run_hardware_acceleration
                             # 清理缓存, 使用动态路径
                             task_item.output_path = None
                             output_path = task_item.output_path
@@ -1942,9 +1973,22 @@ class HomeInterface(QWidget):
             from backend.main import SubtitleRemover
             options = dict(options)
             inpaint_mode = options.pop("inpaint_mode", None)
+            video_bitrate_mbps = options.pop(
+                "video_bitrate_mbps",
+                config.videoOutputBitrateMbps.value,
+            )
+            hardware_acceleration = options.pop(
+                "hardware_acceleration",
+                config.hardwareAcceleration.value,
+            )
             if inpaint_mode is not None:
                 config.inpaintMode.value = inpaint_mode
-            sr = SubtitleRemover(video_path, True)
+            config.hardwareAcceleration.value = bool(hardware_acceleration)
+            sr = SubtitleRemover(
+                video_path,
+                True,
+                video_bitrate_mbps=video_bitrate_mbps,
+            )
             sr.video_out_path = output_path
             for key in options:
                 setattr(sr, key, options[key])
@@ -2357,12 +2401,6 @@ class HomeInterface(QWidget):
             self.video_display_component.selections_changed.disconnect(self.selections_changed)
             self.auto_area_executor.shutdown(wait=False, cancel_futures=False)
             self.moving_preprocess_executor.shutdown(wait=False, cancel_futures=True)
-            for artifact_path in list(self._moving_preprocess_artifacts):
-                try:
-                    if os.path.isfile(artifact_path):
-                        os.remove(artifact_path)
-                except OSError:
-                    pass
             # 释放视频资源
             with self._video_cap_lock:
                 if self.video_cap:

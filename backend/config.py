@@ -119,6 +119,14 @@ class Config(QConfig):
     # 视频保存目录
     saveDirectory = ConfigItem("Main", "SaveDirectory", "", ConfigValidator())
 
+    # 生成视频的视频轨固定码率（Mbps，不包含音频）
+    videoOutputBitrateMbps = RangeConfigItem(
+        "Main",
+        "VideoOutputBitrateMbps",
+        4.5,
+        RangeValidator(1.0, 100.0),
+    )
+
 CONFIG_FILE = 'config/config.json'
 config = Config()
 qconfig.load(CONFIG_FILE, config)
