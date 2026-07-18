@@ -28,146 +28,23 @@ def batch_generator(data, max_batch_size):
     if last_batch_start < n_samples:
         yield data[last_batch_start:]
 
-def create_mask(size, coords_list, deviation=None):
+def create_mask(size, coords_list):
     mask = np.zeros(size, dtype="uint8")
-    deviation = config.subtitleAreaDeviationPixel.value if deviation is None else max(0, int(deviation))
     if coords_list:
         for coords in coords_list:
             xmin, xmax, ymin, ymax = coords
-            # 字幕模式默认适当放大选区；固定水印可显式传入独立扩张值。
-            x1 = xmin - deviation
+            # 为了避免框过小，放大10个像素
+            x1 = xmin - config.subtitleAreaDeviationPixel.value
             if x1 < 0:
                 x1 = 0
-            y1 = ymin - deviation
+            y1 = ymin - config.subtitleAreaDeviationPixel.value
             if y1 < 0:
                 y1 = 0
-            x2 = xmax + deviation
-            y2 = ymax + deviation
+            x2 = xmax + config.subtitleAreaDeviationPixel.value
+            y2 = ymax + config.subtitleAreaDeviationPixel.value
             cv2.rectangle(mask, (x1, y1),
                           (x2, y2), (255, 255, 255), thickness=-1)
     return mask
-
-
-def build_fixed_watermark_masks(
-    selection_mask,
-    erase_margin=2,
-    feather_radius=12,
-    reference_shape=None,
-):
-    """Build fixed-watermark inference and one-way feather masks.
-
-    ``core`` is fully replaced so feathering never mixes watermark pixels back
-    into the result. ``outer`` gives the model a narrow generated transition
-    ring, while ``alpha`` fades only outside ``core``.
-    """
-    mask = np.asarray(selection_mask)
-    if mask.ndim == 3:
-        mask = np.max(mask, axis=2)
-    raw = (mask > 0).astype(np.uint8)
-    if not np.any(raw):
-        zeros = np.zeros(raw.shape, dtype=np.uint8)
-        return zeros, zeros.copy(), zeros.astype(np.float32)
-
-    height, width = raw.shape
-    scale_height, scale_width = (
-        reference_shape[:2] if reference_shape is not None else (height, width)
-    )
-    scale = max(0.25, min(scale_height, scale_width) / 720.0)
-    erase_margin = max(0, int(round(erase_margin * scale)))
-    feather_radius = max(2, int(round(feather_radius * scale)))
-
-    if erase_margin > 0:
-        erase_kernel = cv2.getStructuringElement(
-            cv2.MORPH_ELLIPSE,
-            (erase_margin * 2 + 1, erase_margin * 2 + 1),
-        )
-        core = cv2.dilate(raw, erase_kernel)
-    else:
-        core = raw
-
-    feather_kernel = cv2.getStructuringElement(
-        cv2.MORPH_ELLIPSE,
-        (feather_radius * 2 + 1, feather_radius * 2 + 1),
-    )
-    outer = cv2.dilate(core, feather_kernel)
-
-    distance_from_core = cv2.distanceTransform(
-        (1 - core).astype(np.uint8),
-        cv2.DIST_L2,
-        cv2.DIST_MASK_PRECISE,
-    )
-    transition = np.clip(1.0 - distance_from_core / float(feather_radius + 1), 0.0, 1.0)
-    alpha = transition * transition * (3.0 - 2.0 * transition)
-    alpha[core > 0] = 1.0
-    alpha[outer == 0] = 0.0
-    return core.astype(np.uint8) * 255, outer.astype(np.uint8) * 255, alpha.astype(np.float32)
-
-
-def get_fixed_watermark_rois(mask, context=None, multiple=8):
-    """Return padded local ROIs which completely contain every mask island."""
-    binary = np.asarray(mask)
-    if binary.ndim == 3:
-        binary = np.max(binary, axis=2)
-    binary = (binary > 0).astype(np.uint8)
-    if not np.any(binary):
-        return []
-
-    height, width = binary.shape
-    count, _, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
-    rois = []
-    for label in range(1, count):
-        x = int(stats[label, cv2.CC_STAT_LEFT])
-        y = int(stats[label, cv2.CC_STAT_TOP])
-        component_width = int(stats[label, cv2.CC_STAT_WIDTH])
-        component_height = int(stats[label, cv2.CC_STAT_HEIGHT])
-        if component_width <= 0 or component_height <= 0:
-            continue
-
-        if context is None:
-            scale = max(0.25, min(height, width) / 720.0)
-            minimum_context = max(8, int(round(32 * scale)))
-            maximum_context = max(minimum_context, int(round(96 * scale)))
-            padding = int(round(max(component_width, component_height) * 0.25))
-            padding = max(minimum_context, min(maximum_context, padding))
-        else:
-            padding = max(0, int(context))
-
-        x0 = max(0, x - padding)
-        y0 = max(0, y - padding)
-        x1 = min(width, x + component_width + padding)
-        y1 = min(height, y + component_height + padding)
-        rois.append((y0, y1, x0, x1))
-
-    # Padded selections can overlap. Merge them so a pixel is blended once.
-    merged = []
-    for roi in rois:
-        y0, y1, x0, x1 = roi
-        changed = True
-        while changed:
-            changed = False
-            remaining = []
-            for other in merged:
-                oy0, oy1, ox0, ox1 = other
-                separated = x1 < ox0 or ox1 < x0 or y1 < oy0 or oy1 < y0
-                if separated:
-                    remaining.append(other)
-                    continue
-                y0, y1 = min(y0, oy0), max(y1, oy1)
-                x0, x1 = min(x0, ox0), max(x1, ox1)
-                changed = True
-            merged = remaining
-        merged.append((y0, y1, x0, x1))
-
-    multiple = max(1, int(multiple))
-    aligned = []
-    for y0, y1, x0, x1 in merged:
-        if multiple > 1:
-            y0 = max(0, (y0 // multiple) * multiple)
-            x0 = max(0, (x0 // multiple) * multiple)
-            y1 = min(height, ((y1 + multiple - 1) // multiple) * multiple)
-            x1 = min(width, ((x1 + multiple - 1) // multiple) * multiple)
-        aligned.append((y0, y1, x0, x1))
-    return aligned
 
 def get_inpaint_area_by_mask(W, H, h, mask, multiple=1):
     """
@@ -439,13 +316,8 @@ def is_frame_number_in_ab_sections(frame_no, ab_sections):
     if len(ab_sections) <= 0:
         return True
     for section in ab_sections:
-        if isinstance(section, range):
-            if frame_no in section:
-                return True
-            continue
-        if isinstance(section, (tuple, list)) and len(section) >= 2:
-            if section[0] <= frame_no <= section[1]:
-                return True
+        if frame_no in section:
+            return True
     return False
 
 if __name__ == '__main__':

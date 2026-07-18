@@ -71,43 +71,12 @@ class SettingInterface(QtWidgets.QVBoxLayout):
             self.hardware_acceleration.switchButton.setEnabled(False)
             self.hardware_acceleration.setContent(tr["Setting"]["HardwareAccelerationNO"])
             config.set(config.hardwareAcceleration, False)
-
-        self.moving_watermark_fast_mode = SwitchSettingCard(
-            configItem=config.movingWatermarkFastMode,
-            icon=FluentIcon.SPEED_HIGH,
-            title=tr["Setting"]["MovingWatermarkFastMode"],
-            content=tr["Setting"]["MovingWatermarkFastModeDesc"],
-            parent=parent,
-        )
-        self.addWidget(self.moving_watermark_fast_mode)
         # 添加一些空间
         self.addStretch(1)
     
     def set_inpaint_mode_enabled(self, enabled):
         """启用或禁用 inpaint 模式下拉框"""
         self.inpaint_mode_combo.comboBox.setEnabled(enabled)
-
-    def set_subtitle_controls_enabled(self, enabled):
-        """Enable OCR-related controls only for modes that use subtitle detection."""
-        self.subtitle_detect_model_combo.setEnabled(enabled)
-        self.auto_subtitle_area_selection.setEnabled(enabled)
-
-    def set_batch_controls_enabled(
-        self,
-        enabled,
-        *,
-        mode_enabled=True,
-        subtitle_enabled=True,
-        moving_enabled=True,
-    ):
-        """Lock every setting that can change an active batch's behavior."""
-        self.inpaint_mode_combo.comboBox.setEnabled(enabled and mode_enabled)
-        self.subtitle_detect_model_combo.setEnabled(enabled and subtitle_enabled)
-        self.auto_subtitle_area_selection.setEnabled(enabled and subtitle_enabled)
-        self.hardware_acceleration.setEnabled(
-            enabled and HARDWARD_ACCELERATION_OPTION
-        )
-        self.moving_watermark_fast_mode.setEnabled(enabled and moving_enabled)
 
     def reset_setting(self):
         """重置所有设置为默认值"""

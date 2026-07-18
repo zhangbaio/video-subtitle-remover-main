@@ -7,7 +7,6 @@ from typing import List
 import cv2
 import numpy as np
 import torch
-from tqdm import tqdm
 from torchvision import transforms
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -18,7 +17,8 @@ from backend.inpaint.sttn.auto_sttn import InpaintGenerator
 from backend.inpaint.utils.sttn_utils import Stack, ToTorchFormatTensor
 from backend.tools.hardware_accelerator import HardwareAccelerator
 from backend.tools.inpaint_tools import get_inpaint_area_by_mask, is_frame_number_in_ab_sections
-from backend.tools.video_io import FramePrefetcher, create_processing_capture
+from backend.tools.progress import safe_tqdm_write
+from backend.tools.video_io import FramePrefetcher
 
 
 _to_tensors = transforms.Compose([
@@ -33,8 +33,6 @@ class STTNInpaint:
         self.model = InpaintGenerator().to(self.device)
         self.model.load_state_dict(torch.load(model_path, map_location="cpu")["netG"])
         self.model.eval()
-        if getattr(self.device, "type", "") == "cuda":
-            torch.backends.cudnn.benchmark = True
         self.model_input_width, self.model_input_height = 640, 120
         self.neighbor_stride = config.sttnNeighborStride.value
         self.ref_length = config.sttnReferenceLength.value
@@ -98,7 +96,7 @@ class STTNInpaint:
         feats = feats.to(self.device)
         comp_frames = [None] * frame_length
 
-        with torch.inference_mode():
+        with torch.no_grad():
             feats = self.model.encoder(
                 feats.view(frame_length, 3, self.model_input_height, self.model_input_width)
             )
@@ -160,17 +158,6 @@ class STTNAutoInpaint:
 
         try:
             reader, frame_info = self.read_frame_info_from_video()
-            read_cap = create_processing_capture(
-                self.video_path,
-                frame_info["W_ori"],
-                frame_info["H_ori"],
-                fps=frame_info["fps"],
-                frame_count=frame_info["len"],
-                fallback_cap=reader,
-            )
-            if read_cap is not reader:
-                reader.release()
-                reader = read_cap
             prefetcher = FramePrefetcher(reader)
 
             if input_sub_remover is not None:
@@ -208,7 +195,7 @@ class STTNAutoInpaint:
                 max_frames_by_vram = max(max_frames_by_vram, 10)
                 effective_clip_gap = min(self.clip_gap, max_frames_by_vram)
                 if effective_clip_gap < self.clip_gap:
-                    tqdm.write(
+                    safe_tqdm_write(
                         f"GPU VRAM: {vram_mb:.0f}MB, adjusting clip_gap: "
                         f"{self.clip_gap} -> {effective_clip_gap}"
                     )
@@ -222,7 +209,7 @@ class STTNAutoInpaint:
             for i in range(rec_time):
                 start_f = i * effective_clip_gap
                 end_f = min((i + 1) * effective_clip_gap, frame_info["len"])
-                tqdm.write(
+                safe_tqdm_write(
                     f"Processing: {start_f + 1} - {end_f} / Total: {frame_info['len']}"
                 )
 
@@ -305,13 +292,12 @@ class STTNAutoInpaint:
                                 input_sub_remover.push_preview_with_comp(original_frame, frame)
 
                 del frames_hr, frames, comps
-                if i % 8 == 7:
-                    gc.collect()
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
         except Exception as e:
-            print(f"Error during video processing: {str(e)}")
+            safe_tqdm_write(f"Error during video processing: {str(e)}")
             raise
         finally:
             if prefetcher:

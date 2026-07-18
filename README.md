@@ -22,10 +22,6 @@ Video-subtitle-remover (VSR) 是一款基于AI技术，将视频中的硬字幕�
 - 支持自定义字幕位置，仅去除定义位置中的字幕（传入位置）
 - 支持全视频自动去除所有文本（不传入位置）
 - 支持多选图片批量去除水印文本
-- 支持固定水印模式：紧贴 Logo/角标边缘框选后，使用真实遮罩和 ProPainter 逐帧修复，无需 OCR
-- 支持移动水印自动跟踪模式：拖动进度条到水印清晰的一帧，只框选一个水印，程序会在整段视频中自动跟踪移动或换角位置；低置信度和无水印帧会保留原画面
-- 支持“字幕 + 固定水印”和“字幕 + 移动水印”联合模式：字幕框与水印框分层保存，逐帧合并遮罩后只解码、修复和编码一次
-- 文件夹批量处理移动水印时，当前视频进入 GPU 修复后会用 CPU 提前跟踪下一条视频；下一条可直接复用预处理结果，且同时最多预处理一条
 
 ![demo.png](https://github.com/YaoFANGUK/video-subtitle-remover/raw/main/design/demo.png)
 
@@ -81,13 +77,7 @@ options:
                         Output video file path (optional)
   --subtitle-area-coords YMIN YMAX XMIN XMAX, -c YMIN YMAX XMIN XMAX
                         Subtitle area coordinates (ymin ymax xmin xmax). Can be specified multiple times for multiple areas.
-  --watermark-area-coords YMIN YMAX XMIN XMAX, -w YMIN YMAX XMIN XMAX
-                        Watermark area coordinates (ymin ymax xmin xmax). Can be specified multiple times for fixed watermarks.
-  --watermark-reference-frame WATERMARK_REFERENCE_FRAME
-                        Zero-based reference frame used by moving-watermark modes (default: 0).
-  --watermark-template-source WATERMARK_TEMPLATE_SOURCE
-                        Optional video containing the moving-watermark reference template.
-  --inpaint-mode {sttn-auto,sttn-det,lama,propainter,opencv,fixed-watermark,moving-watermark,subtitle-fixed-watermark,subtitle-moving-watermark}
+  --inpaint-mode {sttn-auto,sttn-det,lama,propainter,opencv}
                         Inpaint mode, default is sttn-auto
 ```
 ## 演示
@@ -249,11 +239,6 @@ STTN_SKIP_DETECTION = True # 跳过字幕检测，跳过后可能会导致要去
 > - InpaintMode.STTN 算法：对于真人视频效果较好，速度快，可以跳过字幕检测
 > - InpaintMode.LAMA 算法：对于图片效果最好，对动画类视频效果好，速度一般，不可以跳过字幕检测
 > - InpaintMode.PROPAINTER 算法： 需要消耗大量显存，速度较慢，对运动非常剧烈的视频效果较好
-> - InpaintMode.FIXED_WATERMARK 算法：用于位置不变的 Logo/角标，手工选区会直接作为修复遮罩，不进行字幕检测，选框应紧贴水印
-> - InpaintMode.MOVING_WATERMARK 算法：用于会移动或换角的 Logo/角标。在预览中定位到水印清晰的一帧并紧贴水印只框选一次，运行前会先扫描并生成逐帧动态遮罩；同一批次、相同宽高比的视频会复用参考模板
-> - InpaintMode.SUBTITLE_FIXED_WATERMARK / SUBTITLE_MOVING_WATERMARK：分别保存字幕层与水印层，将两类逐帧遮罩取并集后交给 ProPainter，一次生成最终视频
-> - “移动水印快速模式”默认开启，针对紧凑水印降低光流迭代并优化动态遮罩内存；如遇高速复杂运动且更重视画质，可关闭该开关恢复最高质量参数
-> - 批量提前预处理结果会校验视频文件、模板源、参考帧、框选区域和 AB 区间；任一条件变化或缓存损坏时会自动回退实时扫描
 
 - 使用STTN算法
 

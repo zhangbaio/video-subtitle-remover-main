@@ -1,4 +1,3 @@
-import json
 import os
 from enum import Enum, unique
 from dataclasses import dataclass
@@ -21,13 +20,6 @@ from backend.config import config, tr
 from backend.tools.common_tools import is_image_file
 
 
-_COMBINED_MODE_VALUES = {
-    "subtitle-fixed-watermark",
-    "subtitle-moving-watermark",
-}
-_COMPLETION_METADATA_VERSION = 1
-
-
 @unique
 class TaskStatus(Enum):
     PENDING = tr["TaskList"]["Pending"]
@@ -41,11 +33,6 @@ class TaskOptions(Enum):
     AB_SECTIONS = "ab_sections"
     SUB_AREAS = "sub_areas"
     SUB_AREAS_SOURCE = "sub_areas_source"
-    SUBTITLE_INTERVALS = "subtitle_intervals"
-    FIXED_WATERMARK_AREAS = "fixed_watermark_areas"
-    MOVING_WATERMARK_TEMPLATE_AREA = "moving_watermark_template_area"
-    MOVING_WATERMARK_REFERENCE_FRAME_NO = "moving_watermark_reference_frame_no"
-    MOVING_WATERMARK_TEMPLATE_SOURCE_PATH = "moving_watermark_template_source_path"
 
 
 def _format_elapsed(seconds):
@@ -156,73 +143,6 @@ class TaskListComponent(QWidget):
     def _output_file_exists(output_path):
         return bool(output_path) and os.path.isfile(output_path) and os.path.getsize(output_path) > 0
 
-    @staticmethod
-    def _mode_value():
-        mode = config.inpaintMode.value
-        return getattr(mode, "value", str(mode))
-
-    @staticmethod
-    def _file_signature(path):
-        try:
-            stat = os.stat(path)
-        except OSError:
-            return None
-        return {
-            "size": int(stat.st_size),
-            "mtime_ns": int(stat.st_mtime_ns),
-        }
-
-    @staticmethod
-    def _completion_metadata_path(output_path):
-        output_directory = os.path.dirname(os.path.abspath(output_path))
-        return os.path.join(
-            output_directory,
-            ".vsr",
-            f"{os.path.basename(output_path)}.json",
-        )
-
-    def _completion_metadata_matches(self, task, output_path):
-        """Return True/False for metadata matches, or None for legacy outputs."""
-        metadata_path = self._completion_metadata_path(output_path)
-        if not os.path.exists(metadata_path):
-            return None
-        try:
-            with open(metadata_path, "r", encoding="utf-8") as file:
-                metadata = json.load(file)
-        except (OSError, ValueError, TypeError):
-            return False
-        return (
-            metadata.get("version") == _COMPLETION_METADATA_VERSION
-            and metadata.get("mode") == self._mode_value()
-            and metadata.get("source") == self._file_signature(task.path)
-            and metadata.get("output") == self._file_signature(output_path)
-        )
-
-    def _write_completion_metadata(self, task):
-        output_path = task.output_path
-        if not self._output_file_exists(output_path):
-            return False
-        metadata_path = self._completion_metadata_path(output_path)
-        temporary_path = f"{metadata_path}.{os.getpid()}.tmp"
-        metadata = {
-            "version": _COMPLETION_METADATA_VERSION,
-            "mode": self._mode_value(),
-            "source": self._file_signature(task.path),
-            "output": self._file_signature(output_path),
-        }
-        try:
-            os.makedirs(os.path.dirname(metadata_path), exist_ok=True)
-            with open(temporary_path, "w", encoding="utf-8") as file:
-                json.dump(metadata, file, ensure_ascii=False, sort_keys=True)
-            os.replace(temporary_path, metadata_path)
-            return True
-        except OSError:
-            try:
-                os.remove(temporary_path)
-            except OSError:
-                pass
-            return False
-
     def _status_brush(self, status):
         if status == TaskStatus.COMPLETED:
             return QBrush(QColor("#2ecc71"))
@@ -268,28 +188,11 @@ class TaskListComponent(QWidget):
         task = self.tasks[row]
         task._output_path = None
         output_path = task.output_path
-        metadata_matches = (
-            self._completion_metadata_matches(task, output_path)
-            if self._output_file_exists(output_path)
-            else False
-        )
-        legacy_output_is_compatible = (
-            metadata_matches is None
-            and self._mode_value() not in _COMBINED_MODE_VALUES
-        )
-        if metadata_matches is True or legacy_output_is_compatible:
+        if self._output_file_exists(output_path):
             task.output_path = output_path
             task.progress = 100
             task.status = TaskStatus.COMPLETED
-        elif task.status != TaskStatus.PROCESSING:
-            task.progress = 0
-            task.status = TaskStatus.PENDING
         self._sync_task_row(row)
-
-    def resync_completion_states(self, *_):
-        """Re-evaluate imported outputs after the processing mode changes."""
-        for row in range(len(self.tasks)):
-            self._sync_task_completion_from_output(row)
 
     def add_task(self, video_path, batch_id="", source_folder="", output_root="", output_subdir=""):
         row = self.find_task_index_by_path(video_path)
@@ -344,8 +247,6 @@ class TaskListComponent(QWidget):
     def update_task_status(self, index, status):
         if 0 <= index < len(self.tasks):
             self.tasks[index].status = status
-            if status == TaskStatus.COMPLETED:
-                self._write_completion_metadata(self.tasks[index])
             self._sync_task_row(index)
             if index == self.current_task_index:
                 self.table.scrollTo(self.table.model().index(index, 0))
@@ -445,15 +346,6 @@ class TaskListComponent(QWidget):
             if row == self.current_task_index:
                 self.current_task_index = -1
             self.task_deleted.emit(row)
-
-    def clear_tasks(self):
-        """Remove every imported task and reset the table selection."""
-        cleared_count = len(self.tasks)
-        self.tasks.clear()
-        self.current_task_index = -1
-        self.table.clearSelection()
-        self.table.setRowCount(0)
-        return cleared_count
 
     def on_task_clicked(self, index):
         row = index.row()

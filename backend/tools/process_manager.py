@@ -11,6 +11,8 @@ import atexit
 import subprocess
 import concurrent.futures
 
+from .subprocess_utils import hidden_subprocess_kwargs
+
 class ProcessManager:
     """
     进程管理器类，用于管理子进程的生命周期
@@ -118,7 +120,8 @@ class ProcessManager:
             # 使用系统命令强制终止进程
             if platform.system() == 'Windows':
                 subprocess.run(['taskkill', '/F', '/T', '/PID', str(pid)], 
-                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=3)
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=3,
+                    **hidden_subprocess_kwargs())
             else:
                 subprocess.run(['pkill', '-9', '-P', str(pid)], 
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=2)

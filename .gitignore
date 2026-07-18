@@ -367,11 +367,6 @@ $RECYCLE.BIN/
 demo*.mp4
 out*.mp4
 test*.py
-!tests/test_moving_mask.py
-!tests/test_safe_optimizations.py
-!tests/test_combined_removal.py
-!tests/test_combined_ui.py
-!tests/test_task_completion_metadata.py
 test_*.mp4
 test*_no_sub*.mp4
 /test/coods/
@@ -380,6 +375,11 @@ test*_no_sub*.mp4
 /backend/models/big-lama/big-lama.pt
 /test/debug/
 /backend/tools/train/release_model/
+
+# Keep the episode natural-sort regression test under version control.
+!/tests/test_episode_sort.py
+!/tests/test_progress.py
+!/tests/test_subprocess_utils.py
 inference.onnx
 /config/config.json
 

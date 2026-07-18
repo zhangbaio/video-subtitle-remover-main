@@ -41,8 +41,6 @@ class Config(QConfig):
     # 使用一个配置项存储所有选区
     # 默认值为一个选区，格式为："ymin,ymax,xmin,xmax;ymin,ymax,xmin,xmax;..."，分号分隔不同选区
     subtitleSelectionAreas = ConfigItem("Main", "SubtitleSelectionAreas", "0.88,0.99,0.15,0.85")
-    # 固定水印使用独立选区，避免覆盖或误用默认字幕区域
-    fixedWatermarkSelectionAreas = ConfigItem("Main", "FixedWatermarkSelectionAreas", "")
 
     """
     MODE可选算法类型
@@ -50,10 +48,6 @@ class Config(QConfig):
     - InpaintMode.STTN_DET 带字幕检测版, 无智能擦除
     - InpaintMode.LAMA 算法：对于动画类视频效果好，速度一般，不可以跳过字幕检测
     - InpaintMode.PROPAINTER 算法： 需要消耗大量显存，速度较慢，对运动非常剧烈的视频效果较好
-    - InpaintMode.FIXED_WATERMARK 固定水印：手工选区作为真实遮罩，ProPainter全帧修复
-    - InpaintMode.MOVING_WATERMARK 移动水印：模板跟踪生成逐帧动态遮罩
-    - InpaintMode.SUBTITLE_FIXED_WATERMARK 字幕与固定水印：合并两类遮罩后一次修复
-    - InpaintMode.SUBTITLE_MOVING_WATERMARK 字幕与移动水印：字幕遮罩与逐帧跟踪遮罩联合修复
     """
     # 【设置inpaint算法】
     inpaintMode = OptionsConfigItem("Main", "InpaintMode", InpaintMode.STTN_AUTO, OptionsValidator(InpaintMode), EnumSerializer(InpaintMode))
@@ -104,12 +98,6 @@ class Config(QConfig):
     # 1280x720p视频设置80需要25G显存，设置50需要19G显存
     # 720x480p视频设置80需要8G显存，设置50需要7G显存
     propainterMaxLoadNum = RangeConfigItem("ProPainter", "MaxLoadNum", 70, RangeValidator(1, 300))
-    movingWatermarkFastMode = ConfigItem(
-        "ProPainter",
-        "MovingWatermarkFastMode",
-        True,
-        BoolValidator(),
-    )
 
     # 是否使用硬件加速
     hardwareAcceleration = ConfigItem("Main", "HardwareAcceleration", HARDWARD_ACCELERATION_OPTION, BoolValidator())
@@ -120,14 +108,6 @@ class Config(QConfig):
 
     # 视频保存目录
     saveDirectory = ConfigItem("Main", "SaveDirectory", "", ConfigValidator())
-
-    # 生成视频的视频轨固定码率（Mbps，不包含音频）
-    videoOutputBitrateMbps = RangeConfigItem(
-        "Main",
-        "VideoOutputBitrateMbps",
-        4.5,
-        RangeValidator(1.0, 100.0),
-    )
 
 CONFIG_FILE = 'config/config.json'
 config = Config()
