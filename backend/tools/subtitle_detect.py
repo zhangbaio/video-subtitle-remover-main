@@ -18,6 +18,40 @@ from backend.tools.progress import safe_tqdm
 
 _TEXT_DETECTOR_CACHE = {}
 _TEXT_DETECTOR_LOCK = threading.RLock()
+_SUBTITLE_DETECTION_CACHE_VERSION = 1
+_ROI_OCR_BATCH_SIZE = 4
+_LARGE_ROI_OCR_BATCH_SIZE = 2
+_LARGE_ROI_AREA_RATIO = 0.40
+
+
+class SubtitleDetectionCancelled(RuntimeError):
+    """Raised when a background subtitle timeline scan is cancelled."""
+
+
+def _canonical_path(path):
+    return os.path.normcase(os.path.realpath(os.path.abspath(os.fspath(path))))
+
+
+def _file_fingerprint(path):
+    stat = os.stat(path)
+    return {
+        "path": _canonical_path(path),
+        "size": int(stat.st_size),
+        "mtime_ns": int(stat.st_mtime_ns),
+    }
+
+
+def _canonical_subtitle_areas(sub_areas):
+    areas = []
+    for area in sub_areas or []:
+        if area is None or len(area) != 4:
+            continue
+        try:
+            values = tuple(int(round(float(value))) for value in area)
+        except (TypeError, ValueError):
+            continue
+        areas.append(values)
+    return tuple(sorted(set(areas)))
 
 
 def _get_text_detector():
@@ -77,6 +111,49 @@ class SubtitleDetect:
     def text_detector(self):
         return _get_text_detector()
 
+    def cache_signature(self):
+        """Describe every input that can change a subtitle timeline scan."""
+        model_config = ModelConfig()
+        model_files = []
+        for filename in ("inference.pdiparams", "inference.json", "inference.yml"):
+            model_path = os.path.join(model_config.DET_MODEL_DIR, filename)
+            if os.path.isfile(model_path):
+                model_files.append(_file_fingerprint(model_path))
+        return {
+            "version": _SUBTITLE_DETECTION_CACHE_VERSION,
+            "video": _file_fingerprint(self.video_path),
+            "subtitle_areas": _canonical_subtitle_areas(self.sub_areas),
+            "det_model_name": model_config.DET_MODEL_NAME,
+            "det_model_dir": _canonical_path(model_config.DET_MODEL_DIR),
+            "det_model_files": model_files,
+            "sample_step": int(self.SAMPLE_STEP),
+            "area_pixel_tolerance_x": int(config.subtitleAreaPixelToleranceXPixel.value),
+            "area_pixel_tolerance_y": int(config.subtitleAreaPixelToleranceYPixel.value),
+        }
+
+    def create_timeline_cache(self, subtitle_frame_no_box_dict, signature=None):
+        return {
+            "signature": signature or self.cache_signature(),
+            "subtitle_frame_no_box_dict": subtitle_frame_no_box_dict,
+        }
+
+    def get_cached_timeline(self, cache):
+        """Return a validated cached timeline, or None when it is stale/invalid."""
+        if not isinstance(cache, dict):
+            return None
+        try:
+            if cache.get("signature") != self.cache_signature():
+                return None
+        except (OSError, TypeError, ValueError):
+            return None
+        timeline = cache.get("subtitle_frame_no_box_dict")
+        if not isinstance(timeline, dict):
+            return None
+        if any(not isinstance(frame_no, int) or not isinstance(boxes, list)
+               for frame_no, boxes in timeline.items()):
+            return None
+        return timeline
+
     @staticmethod
     def _clip_subtitle_areas(sub_areas, image_height, image_width):
         """Normalize subtitle areas to non-empty, in-frame integer slices."""
@@ -135,6 +212,119 @@ class SubtitleDetect:
                         boxes.append(mapped)
         return boxes
 
+    def _roi_ocr_batch_size(self, img):
+        """Choose a conservative frame batch size for the selected OCR crops."""
+        sub_areas = self.sub_areas
+        if sub_areas is None or len(sub_areas) == 0:
+            # Full-frame OCR has a much larger predictor memory footprint and
+            # deliberately keeps the historical one-frame-at-a-time path.
+            return 1
+
+        image_height, image_width = img.shape[:2]
+        frame_area = max(1, image_height * image_width)
+        detection_areas = self._clip_subtitle_areas(
+            sub_areas,
+            image_height,
+            image_width,
+        )
+        if any(
+            ((ymax - ymin) * (xmax - xmin)) / frame_area
+            >= _LARGE_ROI_AREA_RATIO
+            for ymin, ymax, xmin, xmax in detection_areas
+        ):
+            return _LARGE_ROI_OCR_BATCH_SIZE
+        return _ROI_OCR_BATCH_SIZE
+
+    def detect_subtitle_batch(self, images, batch_size=None):
+        """Detect subtitles in several frames while preserving frame order.
+
+        Only the ROI path is sent to Paddle as a real batch. Full-frame input
+        retains the single-frame implementation to avoid multiplying its much
+        larger preprocessing memory peak.
+        """
+        images = list(images)
+        if not images:
+            return []
+
+        sub_areas = self.sub_areas
+        if sub_areas is None or len(sub_areas) == 0:
+            return [self.detect_subtitle(image) for image in images]
+
+        safe_batch_size = min(self._roi_ocr_batch_size(image) for image in images)
+        if batch_size is None:
+            batch_size = safe_batch_size
+        else:
+            batch_size = min(max(1, int(batch_size)), safe_batch_size)
+
+        crop_groups = {}
+        boxes_by_frame = [[] for _ in images]
+        seen_by_frame = [set() for _ in images]
+        for frame_index, image in enumerate(images):
+            image_height, image_width = image.shape[:2]
+            detection_areas = self._clip_subtitle_areas(
+                sub_areas,
+                image_height,
+                image_width,
+            )
+            for ymin, ymax, xmin, xmax in detection_areas:
+                # Paddle's batch preprocessor is fastest and most predictable
+                # with contiguous arrays; only the small selected ROI is copied.
+                crop = np.ascontiguousarray(image[ymin:ymax, xmin:xmax])
+                # Paddle's ToBatch stage stacks arrays. Group by clipped ROI
+                # geometry so differently shaped manual selections never enter
+                # the same np.stack operation.
+                group_key = (ymin, ymax, xmin, xmax)
+                group = crop_groups.setdefault(
+                    group_key,
+                    {"crops": [], "metadata": []},
+                )
+                group["crops"].append(crop)
+                group["metadata"].append((frame_index, xmin, ymin))
+
+        if not crop_groups:
+            return boxes_by_frame
+
+        # Paddle's cached predictor is not re-entrant. Keep input batching and
+        # result materialization for every compatible ROI group inside one lock
+        # acquisition.
+        grouped_results = []
+        with _TEXT_DETECTOR_LOCK:
+            detector = self.text_detector
+            for group in crop_groups.values():
+                results = list(
+                    detector.predict(group["crops"], batch_size=batch_size)
+                )
+                if len(results) != len(group["metadata"]):
+                    raise RuntimeError(
+                        "Text detector returned an unexpected number of "
+                        "batched ROI results"
+                    )
+                grouped_results.append((group["metadata"], results))
+
+        for crop_metadata, results in grouped_results:
+            for (frame_index, offset_x, offset_y), result in zip(
+                crop_metadata,
+                results,
+            ):
+                dt_polys = result['dt_polys']
+                if dt_polys is None or len(dt_polys) == 0:
+                    continue
+                for local_xmin, local_xmax, local_ymin, local_ymax in get_coordinates(
+                    dt_polys.tolist()
+                ):
+                    mapped = (
+                        local_xmin + offset_x,
+                        local_xmax + offset_x,
+                        local_ymin + offset_y,
+                        local_ymax + offset_y,
+                    )
+                    # Overlapping selections can expose the same text twice,
+                    # but de-duplication must remain isolated to each frame.
+                    if mapped not in seen_by_frame[frame_index]:
+                        seen_by_frame[frame_index].add(mapped)
+                        boxes_by_frame[frame_index].append(mapped)
+        return boxes_by_frame
+
     def detect_subtitle(self, img):
         sub_areas = self.sub_areas
         if sub_areas is not None and len(sub_areas) > 0:
@@ -173,7 +363,7 @@ class SubtitleDetect:
                             break
         return temp_list
 
-    def find_subtitle_frame_no(self, sub_remover=None, progress_callback=None):
+    def find_subtitle_frame_no(self, sub_remover=None, progress_callback=None, cancel_event=None):
         video_cap = cv2.VideoCapture(get_readable_path(self.video_path))
         frame_count = video_cap.get(cv2.CAP_PROP_FRAME_COUNT)
         progress_frame_count = max(1, int(frame_count))
@@ -184,38 +374,86 @@ class SubtitleDetect:
             desc='Subtitle Finding',
         )
         current_frame_no = 0
-        # 阶段1：采样检测，仅对每隔 sample_step 帧执行 OCR
-        sampled_results = {}  # frame_no -> temp_list
+        ab_sections = sub_remover.ab_sections if sub_remover is not None else None
+        sampled_results = {}  # one-based frame number -> boxes
+        pending_samples = []  # [(one-based frame number, decoded frame)]
+
+        def raise_if_cancelled():
+            if cancel_event is not None and cancel_event.is_set():
+                raise SubtitleDetectionCancelled("Subtitle timeline scan cancelled")
+
+        def flush_pending_samples():
+            if not pending_samples:
+                return
+            raise_if_cancelled()
+            frame_numbers = [frame_no for frame_no, _frame in pending_samples]
+            frames = [frame for _frame_no, frame in pending_samples]
+            detected = self.detect_subtitle_batch(frames)
+            raise_if_cancelled()
+            if len(detected) != len(frame_numbers):
+                raise RuntimeError(
+                    "Subtitle batch detection returned an unexpected number "
+                    "of frame results"
+                )
+            for frame_no, temp_list in zip(frame_numbers, detected):
+                if len(temp_list) > 0:
+                    sampled_results[frame_no] = temp_list
+            pending_samples.clear()
+
         if sub_remover:
             sub_remover.append_output(tr['Main']['ProcessingStartFindingSubtitles'])
         if progress_callback:
             progress_callback(0, progress_frame_count)
-        while video_cap.isOpened():
-            ret, frame = video_cap.read()
-            # 如果读取视频帧失败（视频读到最后一帧）
-            if not ret:
-                break
-            # 读取视频帧成功
-            current_frame_no += 1
-            if not is_frame_number_in_ab_sections(current_frame_no - 1, sub_remover.ab_sections):
+        try:
+            while video_cap.isOpened():
+                raise_if_cancelled()
+                ret, frame = video_cap.read()
+                if not ret:
+                    break
+                current_frame_no += 1
+                in_selected_section = is_frame_number_in_ab_sections(
+                    current_frame_no - 1,
+                    ab_sections,
+                )
+                if in_selected_section and (
+                    (current_frame_no - 1) % self.SAMPLE_STEP == 0
+                    or self.SAMPLE_STEP <= 1
+                ):
+                    pending_samples.append((current_frame_no, frame))
+
+                if pending_samples:
+                    pending_batch_size = min(
+                        self._roi_ocr_batch_size(pending_frame)
+                        for _frame_no, pending_frame in pending_samples
+                    )
+                    # Flush before reporting the final frame so 50% progress
+                    # cannot be displayed while the tail OCR batch is pending.
+                    if (
+                        len(pending_samples) >= pending_batch_size
+                        or current_frame_no >= progress_frame_count
+                    ):
+                        flush_pending_samples()
+
                 tbar.update(1)
                 if progress_callback:
                     progress_callback(current_frame_no, progress_frame_count)
-                continue
-            # 仅对采样帧执行 OCR 推理
-            if (current_frame_no - 1) % self.SAMPLE_STEP == 0 or self.SAMPLE_STEP <= 1:
-                temp_list = self.detect_subtitle(frame)
-                if len(temp_list) > 0:
-                    sampled_results[current_frame_no] = temp_list
-            tbar.update(1)
-            if progress_callback:
-                progress_callback(current_frame_no, progress_frame_count)
-            elif sub_remover:
-                sub_remover.progress_total = (100 * float(current_frame_no) / float(frame_count)) // 2
-        video_cap.release()
+                elif sub_remover:
+                    sub_remover.progress_total = (
+                        100 * float(current_frame_no) / float(frame_count)
+                    ) // 2
+
+            # Video metadata can under/over-report its frame count. Always
+            # process the final partial batch after the decoder reaches EOF.
+            flush_pending_samples()
+        finally:
+            video_cap.release()
+            close_tbar = getattr(tbar, "close", None)
+            if close_tbar is not None:
+                close_tbar()
         if progress_callback and current_frame_no < progress_frame_count:
             progress_callback(progress_frame_count, progress_frame_count)
-        # 阶段2：插值填充 — 两个采样帧之间都有字幕时，中间帧也标记为有字幕
+
+        # Fill short gaps between adjacent sampled subtitle detections.
         subtitle_frame_no_box_dict = {}
         detected_nos = sorted(sampled_results.keys())
         max_gap = self.SAMPLE_STEP * 2
@@ -225,7 +463,6 @@ class SubtitleDetect:
                 fill_mask = sampled_results[f]
                 for fill_f in range(f + 1, next_f):
                     subtitle_frame_no_box_dict[fill_f] = fill_mask
-        # 添加最后一个检测帧
         if detected_nos:
             subtitle_frame_no_box_dict[detected_nos[-1]] = sampled_results[detected_nos[-1]]
         subtitle_frame_no_box_dict = self.unify_regions(subtitle_frame_no_box_dict)
@@ -397,6 +634,19 @@ class SubtitleDetect:
             else:
                 merged.append((start, end))
         return merged
+
+
+def scan_subtitle_timeline_cache(video_path, sub_areas, cancel_event=None):
+    """Scan a complete video timeline and return a strictly fingerprinted cache."""
+    detector = SubtitleDetect(video_path, sub_areas)
+    signature_before = detector.cache_signature()
+    timeline = detector.find_subtitle_frame_no(cancel_event=cancel_event)
+    if cancel_event is not None and cancel_event.is_set():
+        raise SubtitleDetectionCancelled("Subtitle timeline scan cancelled")
+    signature_after = detector.cache_signature()
+    if signature_before != signature_after:
+        raise RuntimeError("Video or subtitle detection settings changed during pre-scan")
+    return detector.create_timeline_cache(timeline, signature=signature_after)
 
 
 def _percentile(values, q):

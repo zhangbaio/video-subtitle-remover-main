@@ -382,6 +382,9 @@ test*_no_sub*.mp4
 !/tests/test_subprocess_utils.py
 !/tests/test_auto_subtitle_area.py
 !/tests/test_sttn_detection_progress.py
+!/tests/test_sttn_cuda_optimizations.py
+!/tests/test_video_io.py
+!/tests/test_subtitle_timeline_prefetch.py
 inference.onnx
 /config/config.json
 

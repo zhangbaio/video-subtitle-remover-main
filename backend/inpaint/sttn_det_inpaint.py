@@ -1,4 +1,5 @@
 import time
+from contextlib import contextmanager
 
 import cv2
 import numpy as np
@@ -13,6 +14,57 @@ from backend.config import config
 from backend.inpaint.sttn.network_sttn import InpaintGenerator
 from backend.inpaint.utils.sttn_utils import Stack, ToTorchFormatTensor
 from backend.tools.inpaint_tools import get_inpaint_area_by_mask
+
+
+def _configure_cuda_inference(device):
+    """Enable safe float32 CUDA inference optimizations for fixed-size STTN input."""
+    try:
+        device_type = torch.device(device).type
+    except (TypeError, RuntimeError):
+        device_type = getattr(device, "type", None)
+
+    if device_type != "cuda":
+        return False
+
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.backends.cudnn.benchmark = True
+    set_matmul_precision = getattr(torch, "set_float32_matmul_precision", None)
+    if callable(set_matmul_precision):
+        set_matmul_precision("high")
+    return True
+
+
+@contextmanager
+def _cuda_inference_optimizations(device):
+    """Temporarily enable CUDA fast paths without leaking them to other models."""
+    try:
+        device_type = torch.device(device).type
+    except (TypeError, RuntimeError):
+        device_type = getattr(device, "type", None)
+
+    if device_type != "cuda":
+        yield
+        return
+
+    original_matmul_tf32 = torch.backends.cuda.matmul.allow_tf32
+    original_cudnn_tf32 = torch.backends.cudnn.allow_tf32
+    original_cudnn_benchmark = torch.backends.cudnn.benchmark
+    get_matmul_precision = getattr(torch, "get_float32_matmul_precision", None)
+    original_matmul_precision = (
+        get_matmul_precision() if callable(get_matmul_precision) else None
+    )
+    _configure_cuda_inference(device)
+    try:
+        yield
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = original_matmul_tf32
+        torch.backends.cudnn.allow_tf32 = original_cudnn_tf32
+        torch.backends.cudnn.benchmark = original_cudnn_benchmark
+        set_matmul_precision = getattr(torch, "set_float32_matmul_precision", None)
+        if callable(set_matmul_precision) and original_matmul_precision is not None:
+            set_matmul_precision(original_matmul_precision)
+
 
 # 定义图像预处理方式
 _to_tensors = transforms.Compose([
@@ -138,7 +190,7 @@ class STTNDetInpaint:
         # 初始化一个与视频长度相同的列表，用于存储处理完成的帧
         comp_frames = [None] * frame_length
         # 统一关闭梯度计算，用于推理阶段节省内存并加速
-        with torch.no_grad():
+        with _cuda_inference_optimizations(self.device), torch.inference_mode():
             # 将处理好的帧通过编码器，产生特征表示
             feats = self.model.encoder((feats*(1-masks_tensor).float()).view(frame_length, 3, self.model_input_height, self.model_input_width))
             # 获取特征维度信息

@@ -79,6 +79,24 @@ class _RecordingPredictor:
         return [{"dt_polys": np.asarray(polygons, dtype=np.float32)}]
 
 
+class _BatchRecordingPredictor:
+    def __init__(self, polygons_per_image):
+        self.polygons_per_image = list(polygons_per_image)
+        self.calls = []
+
+    def predict(self, images, batch_size=None):
+        images = list(images)
+        self.calls.append((images, batch_size))
+        if len(images) > len(self.polygons_per_image):
+            raise AssertionError("unexpected batch length")
+        polygons_for_call = self.polygons_per_image[:len(images)]
+        del self.polygons_per_image[:len(images)]
+        return [
+            {"dt_polys": np.asarray(polygons, dtype=np.float32)}
+            for polygons in polygons_for_call
+        ]
+
+
 class SubtitleDetectionRoiTests(unittest.TestCase):
     @staticmethod
     def _detector(sub_areas):
@@ -151,6 +169,111 @@ class SubtitleDetectionRoiTests(unittest.TestCase):
 
         self.assertEqual(predictor.images, [])
         self.assertEqual(boxes, [])
+
+    def test_roi_batch_preserves_frame_order_offsets_and_per_frame_deduplication(self):
+        frames = [
+            np.zeros((100, 100, 3), dtype=np.uint8),
+            np.ones((100, 100, 3), dtype=np.uint8),
+        ]
+        predictor = _BatchRecordingPredictor(
+            [
+                [_text_polygon(15, 25, 2, 8)],
+                [_text_polygon(20, 30, 3, 9)],
+                [_text_polygon(5, 15, 2, 8)],
+                [],
+            ]
+        )
+        detector = self._detector(
+            [
+                (60, 90, 10, 70),
+                (60, 90, 20, 80),
+            ]
+        )
+
+        with mock.patch.object(subtitle_detect, "_get_text_detector", return_value=predictor):
+            boxes = detector.detect_subtitle_batch(frames)
+
+        self.assertEqual(
+            boxes,
+            [
+                [(25, 35, 62, 68)],
+                [(30, 40, 63, 69)],
+            ],
+        )
+        self.assertEqual(len(predictor.calls), 2)
+        for images, batch_size in predictor.calls:
+            self.assertEqual(batch_size, 4)
+            self.assertEqual([image.shape for image in images], [(30, 60, 3)] * 2)
+            self.assertEqual(int(images[0][0, 0, 0]), 0)
+            self.assertEqual(int(images[1][0, 0, 0]), 1)
+
+    def test_large_roi_limits_predictor_batch_size_to_two(self):
+        frames = [
+            np.zeros((100, 100, 3), dtype=np.uint8),
+            np.zeros((100, 100, 3), dtype=np.uint8),
+        ]
+        predictor = _BatchRecordingPredictor([[], []])
+        detector = self._detector([(0, 80, 0, 80)])
+
+        with mock.patch.object(subtitle_detect, "_get_text_detector", return_value=predictor):
+            self.assertEqual(
+                detector.detect_subtitle_batch(frames, batch_size=8),
+                [[], []],
+            )
+
+        self.assertEqual(predictor.calls[0][1], 2)
+
+    def test_differently_shaped_rois_are_sent_as_separate_predictor_batches(self):
+        frames = [
+            np.zeros((100, 100, 3), dtype=np.uint8),
+            np.ones((100, 100, 3), dtype=np.uint8),
+        ]
+        predictor = _BatchRecordingPredictor([[], [], [], []])
+        detector = self._detector(
+            [
+                (60, 90, 10, 70),
+                (20, 60, 5, 35),
+            ]
+        )
+
+        with mock.patch.object(subtitle_detect, "_get_text_detector", return_value=predictor):
+            self.assertEqual(detector.detect_subtitle_batch(frames), [[], []])
+
+        self.assertEqual(len(predictor.calls), 2)
+        self.assertEqual(
+            [[image.shape for image in images] for images, _batch_size in predictor.calls],
+            [[(30, 60, 3), (30, 60, 3)], [(40, 30, 3), (40, 30, 3)]],
+        )
+        self.assertEqual([batch_size for _images, batch_size in predictor.calls], [4, 4])
+
+    def test_roi_batch_rejects_missing_predictor_results(self):
+        frames = [
+            np.zeros((100, 100, 3), dtype=np.uint8),
+            np.ones((100, 100, 3), dtype=np.uint8),
+        ]
+        predictor = mock.Mock()
+        predictor.predict.return_value = [{"dt_polys": np.empty((0, 4, 2))}]
+        detector = self._detector([(60, 90, 10, 70)])
+
+        with (
+            mock.patch.object(subtitle_detect, "_get_text_detector", return_value=predictor),
+            self.assertRaisesRegex(RuntimeError, "unexpected number"),
+        ):
+            detector.detect_subtitle_batch(frames)
+
+    def test_full_frame_batch_helper_keeps_single_frame_predict_calls(self):
+        frames = [
+            np.zeros((40, 60, 3), dtype=np.uint8),
+            np.ones((40, 60, 3), dtype=np.uint8),
+        ]
+        detector = self._detector([])
+        detector.detect_subtitle = mock.Mock(side_effect=[[(1, 2, 3, 4)], []])
+
+        self.assertEqual(
+            detector.detect_subtitle_batch(frames),
+            [[(1, 2, 3, 4)], []],
+        )
+        self.assertEqual(detector.detect_subtitle.call_count, 2)
 
 
 class AutoSubtitleAreaTests(unittest.TestCase):

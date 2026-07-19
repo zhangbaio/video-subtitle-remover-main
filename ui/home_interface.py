@@ -4,7 +4,11 @@ import threading
 import multiprocessing
 import time
 import traceback
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import (
+    CancelledError,
+    ThreadPoolExecutor,
+    TimeoutError as FuturesTimeoutError,
+)
 from collections import Counter
 from PySide6.QtWidgets import QWidget, QHBoxLayout, QVBoxLayout
 from PySide6.QtCore import Slot, QRect, Signal
@@ -17,7 +21,12 @@ from ui.component.task_list_component import TaskListComponent, TaskStatus, Task
 from ui.icon.my_fluent_icon import MyFluentIcon
 from backend.config import config, tr
 from backend.tools.constant import InpaintMode
-from backend.tools.subtitle_detect import auto_detect_subtitle_area, get_default_subtitle_area
+from backend.tools.subtitle_detect import (
+    SubtitleDetectionCancelled,
+    auto_detect_subtitle_area,
+    get_default_subtitle_area,
+    scan_subtitle_timeline_cache,
+)
 from backend.tools.subtitle_remover_remote_call import SubtitleRemoverRemoteCall
 from backend.tools.process_manager import ProcessManager
 from backend.tools.common_tools import get_readable_path, is_image_file, is_video_file, read_image
@@ -39,6 +48,55 @@ def _are_normalized_preview_areas(areas):
     except (TypeError, ValueError):
         return False
     return True
+
+
+def _preview_areas_to_video_coordinates(
+    preview_areas,
+    frame_width,
+    frame_height,
+    preview_width,
+    preview_height,
+):
+    """Convert saved normalized preview selections without touching Qt widgets."""
+    if not _are_normalized_preview_areas(preview_areas):
+        return []
+    frame_width = int(frame_width or 0)
+    frame_height = int(frame_height or 0)
+    preview_width = int(preview_width or 0)
+    preview_height = int(preview_height or 0)
+    if min(frame_width, frame_height, preview_width, preview_height) <= 0:
+        return []
+
+    image_ratio = frame_width / frame_height
+    target_ratio = preview_width / preview_height
+    if image_ratio > target_ratio:
+        scaled_width_px = preview_width
+        scaled_height_px = max(1, int(scaled_width_px / image_ratio))
+        border_left = 0.0
+        border_top = ((preview_height - scaled_height_px) // 2) / preview_height
+    else:
+        scaled_height_px = preview_height
+        scaled_width_px = max(1, int(scaled_height_px * image_ratio))
+        border_left = ((preview_width - scaled_width_px) // 2) / preview_width
+        border_top = 0.0
+    scaled_width = scaled_width_px / preview_width
+    scaled_height = scaled_height_px / preview_height
+
+    converted = []
+    for ymin, ymax, xmin, xmax in preview_areas:
+        x_adjusted = max(0.0, float(xmin) - border_left)
+        y_adjusted = max(0.0, float(ymin) - border_top)
+        width_adjusted = min(float(xmax) - float(xmin), scaled_width - x_adjusted)
+        height_adjusted = min(float(ymax) - float(ymin), scaled_height - y_adjusted)
+        if width_adjusted <= 0 or height_adjusted <= 0:
+            continue
+        video_xmin = max(0, min(round(x_adjusted / scaled_width * frame_width), frame_width))
+        video_xmax = max(0, min(round((x_adjusted + width_adjusted) / scaled_width * frame_width), frame_width))
+        video_ymin = max(0, min(round(y_adjusted / scaled_height * frame_height), frame_height))
+        video_ymax = max(0, min(round((y_adjusted + height_adjusted) / scaled_height * frame_height), frame_height))
+        if video_ymin < video_ymax and video_xmin < video_xmax:
+            converted.append((video_ymin, video_ymax, video_xmin, video_xmax))
+    return converted
 
 
 class BatchFolderManagerDialog(QtWidgets.QDialog):
@@ -163,6 +221,8 @@ class BatchFolderManagerDialog(QtWidgets.QDialog):
         self.accept()
 
 class HomeInterface(QWidget):
+    SUBTITLE_TIMELINE_WAIT_TIMEOUT_SECONDS = 120.0
+
     progress_signal = Signal(int, bool)
     append_log_signal = Signal(list)
     update_preview_with_comp_signal = Signal(list)
@@ -213,6 +273,17 @@ class HomeInterface(QWidget):
         self._auto_area_futures = {}
         self._auto_area_results = {}
         self._auto_area_errors = {}
+        # Full subtitle timelines are scanned one episode ahead while the
+        # active worker is in its GPU-heavy STTN repair stage.
+        self.subtitle_timeline_executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="subtitle-timeline",
+        )
+        self._subtitle_timeline_lock = threading.Lock()
+        self._subtitle_timeline_cancel_event = threading.Event()
+        self._subtitle_timeline_futures = {}
+        self._subtitle_timeline_results = {}
+        self._subtitle_timeline_errors = {}
 
         # 当前正在处理的任务索引
         self.current_processing_task_index = -1
@@ -481,6 +552,7 @@ class HomeInterface(QWidget):
     def stop_button_clicked(self):
         try:
             self._stop_event.set()
+            self._cancel_subtitle_timeline_prefetch(clear=True)
             self._resume_auto_area_preprocessing()
             running_process = self.running_process
             if running_process:
@@ -655,6 +727,10 @@ class HomeInterface(QWidget):
         self._auto_area_prefetch_started_for_task = task_index
         self._resume_auto_area_preprocessing()
         self._schedule_pending_auto_area_detections()
+        if mode == InpaintMode.STTN_DET:
+            schedule_timeline = getattr(self, "_schedule_subtitle_timeline_prefetch", None)
+            if schedule_timeline is not None:
+                schedule_timeline()
         return True
 
     def _get_auto_area_detection_result(self, video_path):
@@ -663,6 +739,234 @@ class HomeInterface(QWidget):
             future = self._auto_area_futures.get(video_path)
             error = self._auto_area_errors.get(video_path)
         return result, future, error
+
+    @staticmethod
+    def _subtitle_timeline_key(video_path):
+        return os.path.normcase(os.path.realpath(os.path.abspath(video_path)))
+
+    def _cancel_subtitle_timeline_prefetch(self, clear=True):
+        """Cooperatively stop scans and discard results that must not leak runs."""
+        self._subtitle_timeline_cancel_event.set()
+        with self._subtitle_timeline_lock:
+            futures = list(self._subtitle_timeline_futures.values())
+            if clear:
+                self._subtitle_timeline_futures.clear()
+                self._subtitle_timeline_results.clear()
+                self._subtitle_timeline_errors.clear()
+        # Future.cancel() may synchronously run callbacks. Never call it while
+        # holding the lock those callbacks acquire.
+        for future in futures:
+            future.cancel()
+
+    def _reset_subtitle_timeline_prefetch(self):
+        self._cancel_subtitle_timeline_prefetch(clear=True)
+        self._subtitle_timeline_cancel_event = threading.Event()
+
+    def _next_pending_task(self):
+        pending_tasks = self.task_list_component.get_pending_tasks()
+        if not pending_tasks:
+            return None
+        current_task = self.task_list_component.get_task(self.current_processing_task_index)
+        if current_task is not None and current_task.batch_id:
+            same_batch = self.task_list_component.get_pending_tasks_by_batch(current_task.batch_id)
+            if same_batch:
+                return same_batch[0]
+        return pending_tasks[0]
+
+    @staticmethod
+    def _wait_for_future_or_cancel(future, cancel_event):
+        while not cancel_event.is_set():
+            try:
+                return future.result(timeout=0.2)
+            except FuturesTimeoutError:
+                continue
+        raise SubtitleDetectionCancelled("Subtitle timeline pre-scan cancelled")
+
+    def _run_subtitle_timeline_prefetch(
+        self,
+        video_path,
+        preview_areas,
+        auto_area_result,
+        auto_area_future,
+        preview_size,
+        cancel_event,
+    ):
+        if cancel_event.is_set():
+            raise SubtitleDetectionCancelled("Subtitle timeline pre-scan cancelled")
+
+        detected_areas = None
+        if auto_area_result is not None:
+            detected_areas = auto_area_result[0]
+        elif auto_area_future is not None:
+            detected_areas = self._wait_for_future_or_cancel(
+                auto_area_future,
+                cancel_event,
+            )[0]
+
+        cap = cv2.VideoCapture(get_readable_path(video_path))
+        try:
+            if not cap.isOpened():
+                raise RuntimeError(f"Unable to open video for subtitle pre-scan: {video_path}")
+            frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+            frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+        finally:
+            cap.release()
+
+        if detected_areas:
+            video_areas = detected_areas
+        else:
+            video_areas = _preview_areas_to_video_coordinates(
+                preview_areas,
+                frame_width,
+                frame_height,
+                preview_size[0],
+                preview_size[1],
+            )
+        if not video_areas:
+            fallback = get_default_subtitle_area(frame_width, frame_height)
+            video_areas = [fallback] if fallback else []
+        if not video_areas:
+            raise RuntimeError("Unable to resolve subtitle area for background pre-scan")
+
+        return scan_subtitle_timeline_cache(
+            video_path,
+            video_areas,
+            cancel_event=cancel_event,
+        )
+
+    def _schedule_subtitle_timeline_prefetch(self):
+        if config.inpaintMode.value != InpaintMode.STTN_DET:
+            return False
+        pending = self._next_pending_task()
+        if pending is None:
+            return False
+        task_index, task = pending
+        if is_image_file(task.path):
+            return False
+
+        key = self._subtitle_timeline_key(task.path)
+        with self._subtitle_timeline_lock:
+            if key in self._subtitle_timeline_results or key in self._subtitle_timeline_futures:
+                return False
+
+        auto_area_result = None
+        auto_area_future = None
+        if self._task_needs_auto_area(task_index, task.path):
+            self._schedule_auto_area_detection(task_index, task.path)
+            auto_area_result, auto_area_future, _ = self._get_auto_area_detection_result(task.path)
+
+        preview_areas = list(
+            self.task_list_component.get_task_option(
+                task_index,
+                TaskOptions.SUB_AREAS,
+                [],
+            )
+            or []
+        )
+        preview_size = (
+            self.video_display_component.video_preview_width,
+            self.video_display_component.video_preview_height,
+        )
+        cancel_event = self._subtitle_timeline_cancel_event
+        future = self.subtitle_timeline_executor.submit(
+            self._run_subtitle_timeline_prefetch,
+            task.path,
+            preview_areas,
+            auto_area_result,
+            auto_area_future,
+            preview_size,
+            cancel_event,
+        )
+        with self._subtitle_timeline_lock:
+            self._subtitle_timeline_futures[key] = future
+            self._subtitle_timeline_errors.pop(key, None)
+
+        def _done_callback(done_future):
+            try:
+                cache = done_future.result()
+            except (CancelledError, SubtitleDetectionCancelled):
+                cache = None
+            except Exception as e:
+                with self._subtitle_timeline_lock:
+                    is_registered = self._subtitle_timeline_futures.get(key) is done_future
+                    if (
+                        is_registered
+                        and cancel_event is self._subtitle_timeline_cancel_event
+                        and not cancel_event.is_set()
+                    ):
+                        self._subtitle_timeline_errors[key] = str(e)
+                        self._subtitle_timeline_futures.pop(key, None)
+                return
+
+            with self._subtitle_timeline_lock:
+                is_registered = self._subtitle_timeline_futures.get(key) is done_future
+                if is_registered:
+                    self._subtitle_timeline_futures.pop(key, None)
+                if (
+                    cache is not None
+                    and is_registered
+                    and cancel_event is self._subtitle_timeline_cancel_event
+                    and not cancel_event.is_set()
+                ):
+                    self._subtitle_timeline_results[key] = cache
+                    self._subtitle_timeline_errors.pop(key, None)
+
+        future.add_done_callback(_done_callback)
+        self.append_log_signal.emit([
+            f"已在后台预扫描下一集字幕时间线: {os.path.basename(task.path)}"
+        ])
+        return True
+
+    def _take_subtitle_timeline_cache(self, video_path):
+        """Wait only on the batch worker thread; the Qt UI thread stays free."""
+        key = self._subtitle_timeline_key(video_path)
+        waiting_logged = False
+        wait_deadline = time.monotonic() + max(
+            0.0,
+            float(self.SUBTITLE_TIMELINE_WAIT_TIMEOUT_SECONDS),
+        )
+        while not self._stop_event.is_set():
+            with self._subtitle_timeline_lock:
+                cache = self._subtitle_timeline_results.pop(key, None)
+                future = self._subtitle_timeline_futures.get(key)
+                error = self._subtitle_timeline_errors.pop(key, None)
+            if cache is not None:
+                return cache
+            if future is None:
+                if error:
+                    self.append_log_signal.emit([
+                        f"后台字幕预扫描不可用，将回退正常检测: {error}"
+                    ])
+                return None
+            if not waiting_logged:
+                waiting_logged = True
+                self.append_log_signal.emit([
+                    f"正在等待后台字幕预扫描完成: {os.path.basename(video_path)}"
+                ])
+            remaining = wait_deadline - time.monotonic()
+            if remaining <= 0:
+                self.append_log_signal.emit([
+                    f"后台字幕预扫描等待超过 {self.SUBTITLE_TIMELINE_WAIT_TIMEOUT_SECONDS:g} 秒，"
+                    "已取消预取并回退当前任务正常检测"
+                ])
+                self._reset_subtitle_timeline_prefetch()
+                return None
+            try:
+                cache = future.result(timeout=min(0.2, remaining))
+            except FuturesTimeoutError:
+                continue
+            except (CancelledError, SubtitleDetectionCancelled):
+                return None
+            except Exception as e:
+                self.append_log_signal.emit([
+                    f"后台字幕预扫描不可用，将回退正常检测: {e}"
+                ])
+                return None
+            with self._subtitle_timeline_lock:
+                self._subtitle_timeline_futures.pop(key, None)
+                self._subtitle_timeline_results.pop(key, None)
+            return cache
+        return None
 
     def _apply_detected_areas_to_task(self, task_index, detected_areas, confidence, source="auto", log_prefix=""):
         preview_areas = self.video_display_component.video_coordinates_to_preview_coordinates(detected_areas)
@@ -814,6 +1118,7 @@ class HomeInterface(QWidget):
                 return
 
             self._stop_event.clear()
+            self._reset_subtitle_timeline_prefetch()
             self.toggle_buttons_signal.emit(False)
             # 开启后台线程处理视频
             def task():
@@ -882,6 +1187,10 @@ class HomeInterface(QWidget):
                                 if key == TaskOptions.SUB_AREAS.value:
                                     value = self.video_display_component.preview_coordinates_to_video_coordinates(value)
                                 options[key] = value
+                            if config.inpaintMode.value == InpaintMode.STTN_DET:
+                                timeline_cache = self._take_subtitle_timeline_cache(task_item.path)
+                                if timeline_cache is not None:
+                                    options["subtitle_detection_cache"] = timeline_cache
                             # 清理缓存, 使用动态路径
                             task_item.output_path = None
                             output_path = task_item.output_path
@@ -943,6 +1252,7 @@ class HomeInterface(QWidget):
                                     self.video_cap.release()
                                     self.video_cap = None
                 finally:
+                    self._cancel_subtitle_timeline_prefetch(clear=True)
                     self._resume_auto_area_preprocessing()
                     self.toggle_buttons_signal.emit(True)
 
@@ -1363,6 +1673,7 @@ class HomeInterface(QWidget):
         try:
             # 通知 worker 线程停止
             self._stop_event.set()
+            self._cancel_subtitle_timeline_prefetch(clear=True)
             # 终止子进程
             self._dispose_subtitle_worker(terminate=False)
             ProcessManager.instance().terminate_all()
@@ -1380,7 +1691,8 @@ class HomeInterface(QWidget):
             self.video_display_component.ab_sections_changed.disconnect(self.ab_sections_changed)
             self.video_display_component.selections_changed.disconnect(self.selections_changed)
             self._resume_auto_area_preprocessing()
-            self.auto_area_executor.shutdown(wait=False, cancel_futures=False)
+            self.auto_area_executor.shutdown(wait=False, cancel_futures=True)
+            self.subtitle_timeline_executor.shutdown(wait=False, cancel_futures=True)
             # 释放视频资源
             with self._video_cap_lock:
                 if self.video_cap:

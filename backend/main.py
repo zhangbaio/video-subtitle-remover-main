@@ -20,7 +20,12 @@ from backend.inpaint.sttn_det_inpaint import STTNDetInpaint
 from backend.inpaint.lama_inpaint import LamaInpaint
 from backend.inpaint.opencv_inpaint import OpenCVInpaint
 from backend.inpaint.propainter_inpaint import PropainterInpaint
-from backend.tools.inpaint_tools import create_mask, batch_generator, expand_frame_ranges
+from backend.tools.inpaint_tools import (
+    create_mask,
+    batch_generator,
+    expand_frame_ranges,
+    is_frame_number_in_ab_sections,
+)
 from backend.tools.model_config import ModelConfig
 from backend.tools.ffmpeg_cli import FFmpegCLI
 from backend.tools.progress import safe_tqdm
@@ -106,6 +111,9 @@ class SubtitleRemover:
         self.progress_listeners = []
         # inpaint的frame_no区域列表, 默认为inpaint所有帧
         self.ab_sections = None
+        # Optional in-memory result produced while the previous episode is
+        # already using the GPU. It is always fingerprint-validated before use.
+        self.subtitle_detection_cache = None
         self.preview_emit_interval = 0.2 if gui_mode else 0.0
         self._last_preview_emit_time = 0.0
 
@@ -307,10 +315,26 @@ class SubtitleRemover:
                 self.progress_total = progress
                 self.notify_progress_listeners()
 
-        sub_list = sub_detector.find_subtitle_frame_no(
-            sub_remover=self,
-            progress_callback=detection_progress_callback,
-        )
+        sub_list = sub_detector.get_cached_timeline(self.subtitle_detection_cache)
+        if sub_list is not None:
+            # The pre-scan intentionally covers the complete video. Apply an
+            # optional A/B selection only when the cached result is consumed.
+            sub_list = {
+                frame_no: boxes
+                for frame_no, boxes in sub_list.items()
+                if is_frame_number_in_ab_sections(frame_no - 1, self.ab_sections)
+            }
+            self.append_output("已复用后台预扫描字幕时间线，跳过本集字幕检测")
+            if staged_progress:
+                self.progress_total = 50
+                self.notify_progress_listeners()
+        else:
+            if self.subtitle_detection_cache is not None:
+                self.append_output("后台预扫描缓存已失效，正在重新检测字幕")
+            sub_list = sub_detector.find_subtitle_frame_no(
+                sub_remover=self,
+                progress_callback=detection_progress_callback,
+            )
         if len(sub_list) == 0:
             raise Exception(tr['Main']['NoSubtitleDetected'].format(self.video_path))
         continuous_frame_no_list = sub_detector.find_continuous_ranges_with_same_mask(sub_list)
