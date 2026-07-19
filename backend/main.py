@@ -37,6 +37,14 @@ _LAMA_INPAINT_CACHE = {}
 _STTN_DET_INPAINT_CACHE = {}
 
 
+def _map_stage_progress(completed, total, start=0, end=100):
+    """Map completed work into an inclusive progress stage."""
+    if total <= 0:
+        return int(end)
+    ratio = min(1.0, max(0.0, float(completed) / float(total)))
+    return int(start + (end - start) * ratio)
+
+
 def _device_cache_key(device):
     device_type = getattr(device, "type", None)
     device_index = getattr(device, "index", None)
@@ -121,10 +129,13 @@ class SubtitleRemover:
                 return end_no
         return -1
 
-    def update_progress(self, tbar, increment):
+    def update_progress(self, tbar, increment, progress_range=(0, 100)):
         tbar.update(increment)
-        current_percentage = (tbar.n / tbar.total) * 100
-        self.progress_remover = int(current_percentage)
+        self.progress_remover = _map_stage_progress(
+            tbar.n,
+            tbar.total,
+            *progress_range,
+        )
         self.progress_total = self.progress_remover
         self.notify_progress_listeners()
 
@@ -280,9 +291,26 @@ class SubtitleRemover:
         sttn_video_inpaint = STTNAutoInpaint(self.hardware_accelerator.device, self.model_config.STTN_AUTO_MODEL_PATH, self.video_path)
         sttn_video_inpaint(input_mask=mask, input_sub_remover=self, tbar=tbar)
 
-    def video_inpaint(self, tbar, model):
+    def video_inpaint(self, tbar, model, staged_progress=False):
         sub_detector = SubtitleDetect(self.video_path, self.sub_areas)
-        sub_list = sub_detector.find_subtitle_frame_no(sub_remover=self)
+        inpaint_progress_range = (50, 100) if staged_progress else (0, 100)
+        detection_progress_callback = None
+        if staged_progress:
+            last_detection_progress = None
+
+            def detection_progress_callback(completed, total):
+                nonlocal last_detection_progress
+                progress = _map_stage_progress(completed, total, 0, 50)
+                if progress == last_detection_progress:
+                    return
+                last_detection_progress = progress
+                self.progress_total = progress
+                self.notify_progress_listeners()
+
+        sub_list = sub_detector.find_subtitle_frame_no(
+            sub_remover=self,
+            progress_callback=detection_progress_callback,
+        )
         if len(sub_list) == 0:
             raise Exception(tr['Main']['NoSubtitleDetected'].format(self.video_path))
         continuous_frame_no_list = sub_detector.find_continuous_ranges_with_same_mask(sub_list)
@@ -311,7 +339,11 @@ class SubtitleRemover:
             if current_frame_index not in start_end_map.keys():
                 self.video_writer.write(frame)
                 # self.append_output(f'write frame: {current_frame_index}')
-                self.update_progress(tbar, increment=1)
+                self.update_progress(
+                    tbar,
+                    increment=1,
+                    progress_range=inpaint_progress_range,
+                )
                 self.push_preview_with_comp(frame, frame)
             # 如果是区间开始，则找到尾巴
             else:
@@ -352,7 +384,11 @@ class SubtitleRemover:
                             # self.append_output(f'write frame: {start_frame_index + inner_index} with mask')
                             inner_index += 1
                             self.push_preview_with_comp(np.clip(batch[i]+mask[:,:,np.newaxis]*0.3,0,255).astype(np.uint8), inpainted_frame)
-                    self.update_progress(tbar, increment=len(batch))
+                    self.update_progress(
+                        tbar,
+                        increment=len(batch),
+                        progress_range=inpaint_progress_range,
+                    )
         reader.stop()
 
     def run(self):
@@ -404,7 +440,7 @@ class SubtitleRemover:
             elif config.inpaintMode.value == InpaintMode.STTN_AUTO:
                 self.sttn_auto_mode(tbar)
             elif config.inpaintMode.value == InpaintMode.STTN_DET:
-                self.video_inpaint(tbar, self.sttn_det_inpaint)
+                self.video_inpaint(tbar, self.sttn_det_inpaint, staged_progress=True)
             elif config.inpaintMode.value == InpaintMode.LAMA:
                 self.video_inpaint(tbar, self.lama_inpaint)
             elif config.inpaintMode.value == InpaintMode.OPENCV:

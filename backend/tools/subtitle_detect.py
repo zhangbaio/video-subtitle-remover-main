@@ -1,4 +1,6 @@
+import os
 import sys
+import threading
 
 import cv2
 import numpy as np
@@ -15,31 +17,36 @@ from backend.tools.progress import safe_tqdm
 
 
 _TEXT_DETECTOR_CACHE = {}
+_TEXT_DETECTOR_LOCK = threading.RLock()
 
 
 def _get_text_detector():
-    import paddle
-    paddle.disable_signal_handler()
-    from paddleocr import TextDetection
+    with _TEXT_DETECTOR_LOCK:
+        # Models are bundled locally; avoid PaddleX waiting on remote model
+        # host connectivity every time a fresh worker initializes OCR.
+        os.environ.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "True")
+        import paddle
+        paddle.disable_signal_handler()
+        from paddleocr import TextDetection
 
-    hardware_accelerator = HardwareAccelerator.instance()
-    onnx_providers = tuple(hardware_accelerator.onnx_providers)
-    model_config = ModelConfig()
-    cache_key = (
-        model_config.DET_MODEL_NAME,
-        model_config.DET_MODEL_DIR,
-        onnx_providers,
-    )
-    detector = _TEXT_DETECTOR_CACHE.get(cache_key)
-    if detector is None:
-        detector = TextDetection(
-            model_name=model_config.DET_MODEL_NAME,
-            model_dir=model_config.DET_MODEL_DIR,
-            device="cpu",
-            enable_hpi=len(onnx_providers) > 0,
+        hardware_accelerator = HardwareAccelerator.instance()
+        onnx_providers = tuple(hardware_accelerator.onnx_providers)
+        model_config = ModelConfig()
+        cache_key = (
+            model_config.DET_MODEL_NAME,
+            model_config.DET_MODEL_DIR,
+            onnx_providers,
         )
-        _TEXT_DETECTOR_CACHE[cache_key] = detector
-    return detector
+        detector = _TEXT_DETECTOR_CACHE.get(cache_key)
+        if detector is None:
+            detector = TextDetection(
+                model_name=model_config.DET_MODEL_NAME,
+                model_dir=model_config.DET_MODEL_DIR,
+                device="cpu",
+                enable_hpi=len(onnx_providers) > 0,
+            )
+            _TEXT_DETECTOR_CACHE[cache_key] = detector
+        return detector
 
 class SubtitleDetect:
     """
@@ -70,9 +77,77 @@ class SubtitleDetect:
     def text_detector(self):
         return _get_text_detector()
 
+    @staticmethod
+    def _clip_subtitle_areas(sub_areas, image_height, image_width):
+        """Normalize subtitle areas to non-empty, in-frame integer slices."""
+        clipped_areas = []
+        seen = set()
+        for area in sub_areas:
+            if area is None or len(area) != 4:
+                continue
+            try:
+                values = np.asarray(area, dtype=float)
+            except (TypeError, ValueError):
+                continue
+            if not np.all(np.isfinite(values)):
+                continue
+
+            ymin, ymax, xmin, xmax = values
+            ymin = max(0, min(image_height, int(np.floor(ymin))))
+            ymax = max(0, min(image_height, int(np.ceil(ymax))))
+            xmin = max(0, min(image_width, int(np.floor(xmin))))
+            xmax = max(0, min(image_width, int(np.ceil(xmax))))
+            clipped = (ymin, ymax, xmin, xmax)
+            if ymin >= ymax or xmin >= xmax or clipped in seen:
+                continue
+            seen.add(clipped)
+            clipped_areas.append(clipped)
+        return clipped_areas
+
+    def _detect_subtitle_in_areas(self, img, sub_areas):
+        """Detect cropped subtitle bands and map boxes back to frame coordinates."""
+        image_height, image_width = img.shape[:2]
+        detection_areas = self._clip_subtitle_areas(
+            sub_areas,
+            image_height,
+            image_width,
+        )
+        boxes = []
+        seen = set()
+        for ymin, ymax, xmin, xmax in detection_areas:
+            crop = img[ymin:ymax, xmin:xmax]
+            with _TEXT_DETECTOR_LOCK:
+                results = self.text_detector.predict(crop)
+            for res in results:
+                dt_polys = res['dt_polys']
+                if dt_polys is None or len(dt_polys) == 0:
+                    continue
+                for local_xmin, local_xmax, local_ymin, local_ymax in get_coordinates(dt_polys.tolist()):
+                    mapped = (
+                        local_xmin + xmin,
+                        local_xmax + xmin,
+                        local_ymin + ymin,
+                        local_ymax + ymin,
+                    )
+                    # Overlapping selections can expose the same text twice.
+                    if mapped not in seen:
+                        seen.add(mapped)
+                        boxes.append(mapped)
+        return boxes
+
     def detect_subtitle(self, img):
+        sub_areas = self.sub_areas
+        if sub_areas is not None and len(sub_areas) > 0:
+            # Avoid scanning the full frame only to discard boxes outside the
+            # selected subtitle band afterwards.
+            return self._detect_subtitle_in_areas(img, sub_areas)
+
         temp_list = []
-        results = self.text_detector.predict(img)
+        # Paddle's predictor is cached for performance but is not re-entrant.
+        # Automatic preprocessing and the manual auto-select action may call
+        # this method from different threads, so protect the full prediction.
+        with _TEXT_DETECTOR_LOCK:
+            results = self.text_detector.predict(img)
         sub_areas = self.sub_areas
         has_areas = sub_areas is not None and len(sub_areas) > 0
         for res in results:
@@ -98,9 +173,10 @@ class SubtitleDetect:
                             break
         return temp_list
 
-    def find_subtitle_frame_no(self, sub_remover=None):
+    def find_subtitle_frame_no(self, sub_remover=None, progress_callback=None):
         video_cap = cv2.VideoCapture(get_readable_path(self.video_path))
         frame_count = video_cap.get(cv2.CAP_PROP_FRAME_COUNT)
+        progress_frame_count = max(1, int(frame_count))
         tbar = safe_tqdm(
             total=int(frame_count),
             unit='frame',
@@ -112,6 +188,8 @@ class SubtitleDetect:
         sampled_results = {}  # frame_no -> temp_list
         if sub_remover:
             sub_remover.append_output(tr['Main']['ProcessingStartFindingSubtitles'])
+        if progress_callback:
+            progress_callback(0, progress_frame_count)
         while video_cap.isOpened():
             ret, frame = video_cap.read()
             # 如果读取视频帧失败（视频读到最后一帧）
@@ -121,6 +199,8 @@ class SubtitleDetect:
             current_frame_no += 1
             if not is_frame_number_in_ab_sections(current_frame_no - 1, sub_remover.ab_sections):
                 tbar.update(1)
+                if progress_callback:
+                    progress_callback(current_frame_no, progress_frame_count)
                 continue
             # 仅对采样帧执行 OCR 推理
             if (current_frame_no - 1) % self.SAMPLE_STEP == 0 or self.SAMPLE_STEP <= 1:
@@ -128,9 +208,13 @@ class SubtitleDetect:
                 if len(temp_list) > 0:
                     sampled_results[current_frame_no] = temp_list
             tbar.update(1)
-            if sub_remover:
+            if progress_callback:
+                progress_callback(current_frame_no, progress_frame_count)
+            elif sub_remover:
                 sub_remover.progress_total = (100 * float(current_frame_no) / float(frame_count)) // 2
         video_cap.release()
+        if progress_callback and current_frame_no < progress_frame_count:
+            progress_callback(progress_frame_count, progress_frame_count)
         # 阶段2：插值填充 — 两个采样帧之间都有字幕时，中间帧也标记为有字幕
         subtitle_frame_no_box_dict = {}
         detected_nos = sorted(sampled_results.keys())
@@ -319,6 +403,25 @@ def _percentile(values, q):
     return float(np.percentile(np.array(values, dtype=np.float32), q))
 
 
+def get_default_subtitle_area(frame_width, frame_height):
+    """Return a conservative bottom subtitle band in video coordinates."""
+    frame_width = int(frame_width or 0)
+    frame_height = int(frame_height or 0)
+    if frame_width <= 1 or frame_height <= 1:
+        return None
+
+    ymin = int(frame_height * 0.72)
+    ymax = int(frame_height * 0.95)
+    xmin = int(frame_width * 0.05)
+    xmax = int(frame_width * 0.95)
+    return (
+        max(0, min(ymin, frame_height - 1)),
+        max(ymin + 1, min(ymax, frame_height)),
+        max(0, min(xmin, frame_width - 1)),
+        max(xmin + 1, min(xmax, frame_width)),
+    )
+
+
 def _cluster_by_y_center(boxes, tolerance):
     clusters = []
     for box in sorted(boxes, key=lambda item: (item[2] + item[3]) / 2):
@@ -394,13 +497,8 @@ def auto_detect_subtitle_area(video_path, sample_count=36, bottom_start_ratio=0.
 
     cap.release()
     if not candidate_boxes:
-        fallback = (
-            int(frame_height * 0.72),
-            int(frame_height * 0.95),
-            int(frame_width * 0.05),
-            int(frame_width * 0.95),
-        )
-        return [fallback], 0.0
+        fallback = get_default_subtitle_area(frame_width, frame_height)
+        return ([fallback] if fallback else []), 0.0
 
     clusters = _cluster_by_y_center(candidate_boxes, max(18, int(frame_height * 0.045)))
 
