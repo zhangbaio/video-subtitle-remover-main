@@ -2,19 +2,21 @@ import os
 import cv2
 import threading
 import multiprocessing
+import queue
 import time
 import traceback
 from concurrent.futures import (
     CancelledError,
-    ThreadPoolExecutor,
+    Future,
     TimeoutError as FuturesTimeoutError,
+    wait as wait_futures,
 )
 from collections import Counter
 from PySide6.QtWidgets import QWidget, QHBoxLayout, QVBoxLayout
 from PySide6.QtCore import Slot, QRect, Signal
 from PySide6 import QtWidgets
 from datetime import datetime
-from qfluentwidgets import (PushButton, CardWidget, TextEdit, FluentIcon)
+from qfluentwidgets import (PushButton, CardWidget, TextEdit, FluentIcon, qconfig)
 from ui.setting_interface import SettingInterface
 from ui.component.video_display_component import VideoDisplayComponent
 from ui.component.task_list_component import TaskListComponent, TaskStatus, TaskOptions
@@ -32,6 +34,118 @@ from backend.tools.process_manager import ProcessManager
 from backend.tools.common_tools import get_readable_path, is_image_file, is_video_file, read_image
 from backend.tools.episode_sort import episode_name_sort_key
 from backend.tools.progress import safe_console_stream
+
+
+class _DaemonSingleWorkerExecutor:
+    """A minimal Future executor whose blocked worker cannot hold app exit.
+
+    Paddle/OpenCV inference is not safely interruptible once it has entered a
+    native ``predict`` call.  ``ThreadPoolExecutor`` registers non-daemon
+    workers that Python joins during interpreter shutdown even after
+    ``shutdown(wait=False)``.  This executor preserves the Future API used by
+    preprocessing while keeping exactly one daemon worker per queue, so a
+    wedged optional pre-scan cannot keep the GUI and its worker process alive.
+    """
+
+    def __init__(self, thread_name):
+        self._queue = queue.Queue()
+        self._lock = threading.Lock()
+        self._shutdown = False
+        self._thread = threading.Thread(
+            target=self._run,
+            name=thread_name,
+            daemon=True,
+        )
+        self._thread.start()
+
+    def submit(self, function, /, *args, **kwargs):
+        future = Future()
+        with self._lock:
+            if self._shutdown:
+                raise RuntimeError("cannot schedule new futures after shutdown")
+            self._queue.put((future, function, args, kwargs))
+        return future
+
+    def _run(self):
+        while True:
+            item = self._queue.get()
+            if item is None:
+                return
+            future, function, args, kwargs = item
+            if not future.set_running_or_notify_cancel():
+                continue
+            try:
+                result = function(*args, **kwargs)
+            except BaseException as error:
+                future.set_exception(error)
+            else:
+                future.set_result(result)
+
+    def shutdown(self, wait=True, cancel_futures=False):
+        with self._lock:
+            first_shutdown = not self._shutdown
+            self._shutdown = True
+        if first_shutdown:
+            if cancel_futures:
+                while True:
+                    try:
+                        item = self._queue.get_nowait()
+                    except queue.Empty:
+                        break
+                    if item is not None:
+                        item[0].cancel()
+            self._queue.put(None)
+        if wait and self._thread is not threading.current_thread():
+            self._thread.join()
+
+
+def _exit_after_parent_process(
+    parent_process,
+    exit_func=os._exit,
+    cleanup_func=None,
+):
+    """Wait for the GUI parent, clean child processes, then hard-exit.
+
+    ``os._exit`` intentionally bypasses Python's normal ``atexit`` handlers.
+    Run the supplied cleanup first so an FFmpeg encoder owned by this worker
+    cannot survive as an orphan when the GUI is force-closed.
+    """
+    try:
+        parent_process.join()
+    except (AssertionError, OSError, ValueError):
+        return False
+    if cleanup_func is not None:
+        try:
+            cleanup_func()
+        except BaseException:
+            # Parent-death cleanup is best effort; never let an encoder cleanup
+            # error prevent the worker itself from exiting.
+            pass
+    exit_func(1)
+    return True
+
+
+def _start_parent_death_watchdog(
+    parent_process=None,
+    exit_func=os._exit,
+    cleanup_func=None,
+):
+    """Start a daemon watchdog in a multiprocessing child, if one exists."""
+    if parent_process is None:
+        try:
+            parent_process = multiprocessing.parent_process()
+        except (AssertionError, OSError, ValueError):
+            return None
+    if parent_process is None:
+        return None
+    thread = threading.Thread(
+        target=_exit_after_parent_process,
+        args=(parent_process, exit_func, cleanup_func),
+        name="parent-death-watchdog",
+        daemon=True,
+    )
+    thread.start()
+    return thread
 
 
 def _are_normalized_preview_areas(areas):
@@ -96,6 +210,54 @@ def _preview_areas_to_video_coordinates(
         video_ymax = max(0, min(round((y_adjusted + height_adjusted) / scaled_height * frame_height), frame_height))
         if video_ymin < video_ymax and video_xmin < video_xmax:
             converted.append((video_ymin, video_ymax, video_xmin, video_xmax))
+    return converted
+
+
+def _sanitize_normalized_video_areas(areas):
+    sanitized = []
+    for area in areas or []:
+        try:
+            ymin, ymax, xmin, xmax = (float(value) for value in area)
+        except (TypeError, ValueError):
+            continue
+        ymin, ymax = sorted((max(0.0, ymin), min(1.0, ymax)))
+        xmin, xmax = sorted((max(0.0, xmin), min(1.0, xmax)))
+        if ymin < ymax and xmin < xmax:
+            sanitized.append((ymin, ymax, xmin, xmax))
+    return sanitized
+
+
+def _video_areas_to_normalized(areas, frame_width, frame_height):
+    frame_width = int(frame_width or 0)
+    frame_height = int(frame_height or 0)
+    if frame_width <= 0 or frame_height <= 0:
+        return []
+    return _sanitize_normalized_video_areas([
+        (
+            ymin / frame_height,
+            ymax / frame_height,
+            xmin / frame_width,
+            xmax / frame_width,
+        )
+        for ymin, ymax, xmin, xmax in areas or []
+    ])
+
+
+def _normalized_areas_to_video(areas, frame_width, frame_height):
+    frame_width = int(frame_width or 0)
+    frame_height = int(frame_height or 0)
+    if frame_width <= 0 or frame_height <= 0:
+        return []
+    converted = []
+    for ymin, ymax, xmin, xmax in _sanitize_normalized_video_areas(areas):
+        video_area = (
+            max(0, min(frame_height, round(ymin * frame_height))),
+            max(0, min(frame_height, round(ymax * frame_height))),
+            max(0, min(frame_width, round(xmin * frame_width))),
+            max(0, min(frame_width, round(xmax * frame_width))),
+        )
+        if video_area[0] < video_area[1] and video_area[2] < video_area[3]:
+            converted.append(video_area)
     return converted
 
 
@@ -222,6 +384,7 @@ class BatchFolderManagerDialog(QtWidgets.QDialog):
 
 class HomeInterface(QWidget):
     SUBTITLE_TIMELINE_WAIT_TIMEOUT_SECONDS = 120.0
+    AUTO_AREA_WAIT_TIMEOUT_SECONDS = 120.0
 
     progress_signal = Signal(int, bool)
     append_log_signal = Signal(list)
@@ -230,8 +393,8 @@ class HomeInterface(QWidget):
     toggle_buttons_signal = Signal(bool)  # True=显示运行按钮, False=显示停止按钮
     task_status_signal = Signal(int, object)  # (task_index, TaskStatus)
     select_task_signal = Signal(int)  # task_index
-    auto_subtitle_area_signal = Signal(list, float)
-    auto_subtitle_area_error_signal = Signal(str)
+    auto_subtitle_area_signal = Signal(int, str, int, list, float)
+    auto_subtitle_area_error_signal = Signal(int, str, int, str)
     auto_subtitle_area_running_signal = Signal(bool)
     def __init__(self, parent=None):
         super().__init__(parent=parent)
@@ -259,25 +422,29 @@ class HomeInterface(QWidget):
         self._saved_inpaint_mode = None  # 保存图片锁定前的 inpaint 模式
         self._video_cap_lock = threading.Lock()  # 保护 video_cap 的线程锁
         self._selection_change_source = None
+        self._auto_area_button_running = False
         self.current_processing_batch_id = None
         self.current_processing_task_start_time = None
         self.current_processing_run_start_time = None
         # The cached Paddle predictor is not re-entrant. Keep detection serialized
         # and pause it while the remover process owns CPU/GPU resources.
-        self.auto_area_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="auto-area")
+        self.auto_area_executor = _DaemonSingleWorkerExecutor("auto-area")
         self._auto_area_lock = threading.Lock()
         self._auto_area_condition = threading.Condition()
         self._auto_area_preprocessing_paused = False
         self._auto_area_active_jobs = 0
+        self._auto_area_cancel_event = threading.Event()
+        self._auto_area_unhealthy = False
         self._auto_area_prefetch_started_for_task = None
         self._auto_area_futures = {}
         self._auto_area_results = {}
         self._auto_area_errors = {}
+        self._manual_auto_area_generation = 0
+        self._manual_auto_area_future = None
         # Full subtitle timelines are scanned one episode ahead while the
         # active worker is in its GPU-heavy STTN repair stage.
-        self.subtitle_timeline_executor = ThreadPoolExecutor(
-            max_workers=1,
-            thread_name_prefix="subtitle-timeline",
+        self.subtitle_timeline_executor = _DaemonSingleWorkerExecutor(
+            "subtitle-timeline"
         )
         self._subtitle_timeline_lock = threading.Lock()
         self._subtitle_timeline_cancel_event = threading.Event()
@@ -287,7 +454,11 @@ class HomeInterface(QWidget):
 
         # 当前正在处理的任务索引
         self.current_processing_task_index = -1
+        self._worker_lifecycle_lock = threading.RLock()
+        self._closing = False
+        self._executors_shutdown = False
         self.worker_process = None
+        self.worker_process_id = None
         self.worker_command_queue = None
         self.worker_remote_caller = None
         self.last_worker_job_succeeded = False
@@ -298,11 +469,13 @@ class HomeInterface(QWidget):
         self.update_preview_with_comp_signal.connect(self.update_preview_with_comp)
         self.task_error_signal.connect(self.on_task_error)
         self.toggle_buttons_signal.connect(self._toggle_buttons)
-        self.task_status_signal.connect(lambda idx, status: self.task_list_component.update_task_status(idx, status))
+        self.task_status_signal.connect(self._apply_task_status)
         self.select_task_signal.connect(self.task_list_component.select_task)
         self.auto_subtitle_area_signal.connect(self.on_auto_subtitle_area_detected)
-        self.auto_subtitle_area_error_signal.connect(lambda message: self.append_output(message))
+        self.auto_subtitle_area_error_signal.connect(self.on_auto_subtitle_area_error)
         self.auto_subtitle_area_running_signal.connect(self.set_auto_area_button_running)
+        config.inpaintMode.valueChanged.connect(self.on_inpaint_mode_changed)
+        self.on_inpaint_mode_changed(config.inpaintMode.value)
 
     def __init_widgets(self):
         """创建主页面"""
@@ -441,9 +614,99 @@ class HomeInterface(QWidget):
         get_current_task_index = self.task_list_component.get_current_task_index()
         if get_current_task_index == -1:
             return
+        if config.inpaintMode.value == InpaintMode.FIXED_WATERMARK:
+            video_areas = self.video_display_component.preview_coordinates_to_video_coordinates(
+                selections
+            )
+            normalized_areas = _video_areas_to_normalized(
+                video_areas,
+                self.frame_width,
+                self.frame_height,
+            )
+            self.task_list_component.update_task_option(
+                get_current_task_index,
+                TaskOptions.FIXED_WATERMARK_AREAS,
+                normalized_areas,
+            )
+            self._save_fixed_watermark_areas(normalized_areas)
+            self._propagate_fixed_watermark_areas(
+                get_current_task_index,
+                normalized_areas,
+            )
+            return
         self.task_list_component.update_task_option(get_current_task_index, TaskOptions.SUB_AREAS, selections)
         source = self._selection_change_source or "manual"
         self.task_list_component.update_task_option(get_current_task_index, TaskOptions.SUB_AREAS_SOURCE, source)
+
+    @staticmethod
+    def _parse_fixed_watermark_areas(value):
+        areas = []
+        for serialized_area in (value or "").split(";"):
+            if not serialized_area:
+                continue
+            try:
+                areas.append(tuple(float(part) for part in serialized_area.split(",")))
+            except ValueError:
+                continue
+        return _sanitize_normalized_video_areas(areas)
+
+    @staticmethod
+    def _save_fixed_watermark_areas(areas):
+        serialized = ";".join(
+            f"{ymin:.6f},{ymax:.6f},{xmin:.6f},{xmax:.6f}"
+            for ymin, ymax, xmin, xmax in _sanitize_normalized_video_areas(areas)
+        )
+        config.set(config.fixedWatermarkSelectionAreas, serialized)
+        qconfig.save()
+
+    def _propagate_fixed_watermark_areas(self, task_index, normalized_areas):
+        task = self.task_list_component.get_task(task_index)
+        if task is None:
+            return
+        normalized_areas = _sanitize_normalized_video_areas(normalized_areas)
+        for pending_index, pending_task in self.task_list_component.get_pending_tasks():
+            if pending_index == task_index:
+                continue
+            if task.batch_id and pending_task.batch_id != task.batch_id:
+                continue
+            self.task_list_component.update_task_option(
+                pending_index,
+                TaskOptions.FIXED_WATERMARK_AREAS,
+                list(normalized_areas),
+            )
+
+    def _fixed_watermark_areas_for_task(self, task_index):
+        normalized_areas = _sanitize_normalized_video_areas(
+            self.task_list_component.get_task_option(
+                task_index,
+                TaskOptions.FIXED_WATERMARK_AREAS,
+                [],
+            )
+        )
+        if not normalized_areas:
+            normalized_areas = self._parse_fixed_watermark_areas(
+                config.fixedWatermarkSelectionAreas.value
+            )
+            if normalized_areas:
+                self.task_list_component.update_task_option(
+                    task_index,
+                    TaskOptions.FIXED_WATERMARK_AREAS,
+                    list(normalized_areas),
+                )
+        return normalized_areas
+
+    def _show_fixed_watermark_areas(self, task_index):
+        normalized_areas = self._fixed_watermark_areas_for_task(task_index)
+        video_areas = _normalized_areas_to_video(
+            normalized_areas,
+            self.frame_width,
+            self.frame_height,
+        )
+        preview_areas = self.video_display_component.video_coordinates_to_preview_coordinates(
+            video_areas
+        )
+        self.video_display_component.set_selection_rects(preview_areas)
+        return normalized_areas
 
     def on_task_selected(self, index, file_path):
         """处理任务被选中事件
@@ -456,6 +719,9 @@ class HomeInterface(QWidget):
         self.load_video(file_path)
         ab_sections = self.task_list_component.get_task_option(index, TaskOptions.AB_SECTIONS, [])
         self.video_display_component.set_ab_sections(ab_sections)
+        if config.inpaintMode.value == InpaintMode.FIXED_WATERMARK:
+            self._show_fixed_watermark_areas(index)
+            return
         selections = self.task_list_component.get_task_option(index, TaskOptions.SUB_AREAS, [])
         if len(selections) <= 0:
             self._selection_change_source = "default"
@@ -551,11 +817,12 @@ class HomeInterface(QWidget):
 
     def stop_button_clicked(self):
         try:
-            self._stop_event.set()
+            with self._worker_lifecycle_lock:
+                self._stop_event.set()
+            self._cancel_auto_area_detections(clear=True)
             self._cancel_subtitle_timeline_prefetch(clear=True)
             self._resume_auto_area_preprocessing()
-            running_process = self.running_process
-            if running_process:
+            if self.worker_process is not None or self.running_process is not None:
                 self._dispose_subtitle_worker(terminate=True)
             # 更新任务状态为待处理
             if self.current_processing_task_index >= 0:
@@ -575,99 +842,324 @@ class HomeInterface(QWidget):
         remote_caller.register_error_callback(self.task_error_signal.emit)
 
     def _ensure_subtitle_worker(self):
-        if (
-            self.worker_process
-            and self.worker_process.is_alive()
-            and self.worker_command_queue is not None
-            and self.worker_remote_caller is not None
-        ):
-            self.running_process = self.worker_process
-            return self.worker_process
+        with self._worker_lifecycle_lock:
+            if self._closing or self._stop_event.is_set():
+                return None
+            if (
+                self.worker_process
+                and self.worker_process.is_alive()
+                and self.worker_command_queue is not None
+                and self.worker_remote_caller is not None
+            ):
+                self.running_process = self.worker_process
+                return self.worker_process
 
-        self._dispose_subtitle_worker(terminate=False)
-        remote_caller = SubtitleRemoverRemoteCall()
-        self._register_worker_callbacks(remote_caller)
-        command_queue = multiprocessing.Queue()
-        process = multiprocessing.Process(
-            target=HomeInterface.remover_worker_process,
-            args=(command_queue, remote_caller.queue)
-        )
-        process.start()
-        ProcessManager.instance().add_process(process)
-        self.worker_process = process
-        self.worker_command_queue = command_queue
-        self.worker_remote_caller = remote_caller
-        self.running_process = process
-        return process
+            # Dispose an exited/stale worker before publishing its replacement.
+            # The re-entrant lock keeps closeEvent from slipping between cleanup
+            # and registration of the new persistent worker.
+            self._dispose_subtitle_worker(terminate=False)
+            if self._closing or self._stop_event.is_set():
+                return None
+
+            remote_caller = SubtitleRemoverRemoteCall()
+            self._register_worker_callbacks(remote_caller)
+            command_queue = multiprocessing.Queue()
+            process = multiprocessing.Process(
+                target=HomeInterface.remover_worker_process,
+                args=(command_queue, remote_caller.queue)
+            )
+            manager = ProcessManager.instance()
+            process_started = False
+            try:
+                process.start()
+                process_started = True
+                process_id = manager.add_process(process)
+                if process_id is None:
+                    raise RuntimeError("Application is shutting down; worker creation was rejected")
+            except Exception:
+                # A worker that started but failed registration must never be
+                # left unpublished and unreachable by later shutdown cleanup.
+                if process_started:
+                    try:
+                        is_alive = process.is_alive()
+                    except (AssertionError, OSError, ValueError):
+                        is_alive = True
+                    if is_alive:
+                        try:
+                            manager.terminate_by_process(process)
+                        except Exception:
+                            try:
+                                process.terminate()
+                                process.join(timeout=1)
+                                if process.is_alive():
+                                    process.kill()
+                                    process.join(timeout=1)
+                            except Exception:
+                                pass
+                remote_caller.stop()
+                try:
+                    command_queue.close()
+                    command_queue.cancel_join_thread()
+                except Exception:
+                    pass
+                raise
+
+            self.worker_process = process
+            self.worker_process_id = process_id
+            self.worker_command_queue = command_queue
+            self.worker_remote_caller = remote_caller
+            self.running_process = process
+            return process
 
     def _dispose_subtitle_worker(self, terminate=False):
-        process = self.worker_process
-        command_queue = self.worker_command_queue
-        remote_caller = self.worker_remote_caller
-        self.worker_process = None
-        self.worker_command_queue = None
-        self.worker_remote_caller = None
+        with self._worker_lifecycle_lock:
+            process = self.worker_process
+            process_id = self.worker_process_id
+            command_queue = self.worker_command_queue
+            remote_caller = self.worker_remote_caller
+            self.worker_process = None
+            self.worker_process_id = None
+            self.worker_command_queue = None
+            self.worker_remote_caller = None
+            self.running_process = None
+            self.last_worker_job_succeeded = False
 
-        if process:
-            if terminate:
-                ProcessManager.instance().terminate_by_process(process)
-            else:
-                if process.is_alive() and command_queue is not None:
-                    try:
-                        command_queue.put(("shutdown",))
-                    except Exception:
-                        pass
-                if process.is_alive():
+        manager = ProcessManager.instance()
+        try:
+            if process:
+                is_alive = False
+                try:
+                    is_alive = process.is_alive()
+                except (AssertionError, OSError, ValueError):
+                    pass
+                if terminate and is_alive:
+                    manager.terminate_by_process(process)
+                elif is_alive:
+                    if command_queue is not None:
+                        try:
+                            command_queue.put_nowait(("shutdown",))
+                        except Exception:
+                            pass
                     process.join(timeout=3)
-                if process.is_alive():
-                    ProcessManager.instance().terminate_by_process(process)
-
-        if remote_caller:
-            remote_caller.stop()
-
-        self.running_process = None
-        self.last_worker_job_succeeded = False
+                    if process.is_alive():
+                        manager.terminate_by_process(process)
+        finally:
+            if process_id is not None:
+                manager.remove_process(process_id)
+            if remote_caller:
+                remote_caller.stop()
+            if command_queue is not None:
+                try:
+                    command_queue.close()
+                    command_queue.cancel_join_thread()
+                except Exception:
+                    pass
 
     @Slot(bool)
     def _toggle_buttons(self, show_run):
         """线程安全地切换按钮可见性"""
         self.run_button.setVisible(show_run)
         self.stop_button.setVisible(not show_run)
+        if self._saved_inpaint_mode is None:
+            self.setting_interface.set_inpaint_mode_enabled(show_run)
+        self.auto_area_button.setEnabled(
+            show_run
+            and not self._auto_area_button_running
+            and config.inpaintMode.value != InpaintMode.FIXED_WATERMARK
+        )
+
+    @Slot(int, object)
+    def _apply_task_status(self, task_index, status):
+        # PROCESSING is emitted from the batch thread.  It may already be in
+        # Qt's queued-event stream when the user presses Stop; never allow that
+        # stale callback to overwrite the PENDING state chosen by Stop.
+        if status == TaskStatus.PROCESSING and (
+            self._stop_event.is_set() or self._closing
+        ):
+            return
+        self.task_list_component.update_task_status(task_index, status)
 
     @Slot(bool)
     def set_auto_area_button_running(self, running):
-        self.auto_area_button.setEnabled(not running)
+        if self._closing:
+            return
+        self._auto_area_button_running = bool(running)
+        self.auto_area_button.setEnabled(
+            not running and config.inpaintMode.value != InpaintMode.FIXED_WATERMARK
+        )
         self.auto_area_button.setText("识别中..." if running else "自动框选")
 
+    @Slot(object)
+    def on_inpaint_mode_changed(self, mode):
+        fixed_watermark_mode = mode == InpaintMode.FIXED_WATERMARK
+        self.setting_interface.set_subtitle_controls_enabled(not fixed_watermark_mode)
+        self.auto_area_button.setEnabled(
+            not self._auto_area_button_running and not fixed_watermark_mode
+        )
+        task_index = self.task_list_component.get_current_task_index()
+        if task_index < 0:
+            return
+        if fixed_watermark_mode:
+            self._show_fixed_watermark_areas(task_index)
+            return
+
+        subtitle_areas = self.task_list_component.get_task_option(
+            task_index,
+            TaskOptions.SUB_AREAS,
+            [],
+        )
+        if subtitle_areas:
+            self.video_display_component.set_selection_rects(subtitle_areas)
+        else:
+            self._selection_change_source = "default"
+            try:
+                self.video_display_component.load_selections_from_config()
+            finally:
+                self._selection_change_source = None
+
     def _task_needs_auto_area(self, task_index, video_path):
+        if config.inpaintMode.value == InpaintMode.FIXED_WATERMARK:
+            return False
         subtitle_areas = self.task_list_component.get_task_option(task_index, TaskOptions.SUB_AREAS, [])
         subtitle_areas_source = self.task_list_component.get_task_option(task_index, TaskOptions.SUB_AREAS_SOURCE, "")
         return (
             config.autoSubtitleAreaSelection.value
+            and not getattr(self, "_auto_area_unhealthy", False)
             and not is_image_file(video_path)
             and (not subtitle_areas or subtitle_areas_source in ("", "default", "fallback"))
         )
 
-    def _run_auto_area_detection(self, video_path):
+    def _run_auto_area_detection(self, video_path, cancel_event=None):
         """Run one background detector job only while preprocessing is allowed."""
+        cancel_event = cancel_event or self._auto_area_cancel_event
         with self._auto_area_condition:
             while self._auto_area_preprocessing_paused:
-                self._auto_area_condition.wait()
+                if cancel_event.is_set() or self._closing:
+                    raise SubtitleDetectionCancelled("Automatic subtitle-area detection cancelled")
+                self._auto_area_condition.wait(timeout=0.2)
+            if cancel_event.is_set() or self._closing:
+                raise SubtitleDetectionCancelled("Automatic subtitle-area detection cancelled")
             self._auto_area_active_jobs += 1
 
         try:
-            return auto_detect_subtitle_area(video_path)
+            return auto_detect_subtitle_area(video_path, cancel_event=cancel_event)
         finally:
             with self._auto_area_condition:
                 self._auto_area_active_jobs -= 1
                 self._auto_area_condition.notify_all()
 
+    def _reset_auto_area_cancellation(self):
+        with self._auto_area_lock:
+            if (
+                not self._closing
+                and not self._auto_area_unhealthy
+                and self._auto_area_cancel_event.is_set()
+            ):
+                self._auto_area_cancel_event = threading.Event()
+
+    def _disable_auto_area_preprocessing(self, reason):
+        """Fuse optional OCR pre-scans after a native-call timeout.
+
+        A native Paddle/OpenCV call cannot be killed safely from another
+        Python thread.  Mark the optional pre-scan queue unhealthy, cancel all
+        queued work, and let subtitle removal fall back to the safe bottom
+        band instead of waiting forever behind the wedged call.
+        """
+        with self._auto_area_lock:
+            first_disable = not self._auto_area_unhealthy
+            self._auto_area_unhealthy = True
+            self._auto_area_cancel_event.set()
+            futures = list(self._auto_area_futures.values())
+            manual_entry = self._manual_auto_area_future
+            if manual_entry is not None:
+                futures.append(manual_entry[-1])
+        for future in dict.fromkeys(futures):
+            future.cancel()
+        with self._auto_area_condition:
+            self._auto_area_condition.notify_all()
+        if first_disable:
+            self.append_log_signal.emit([reason])
+
+    def _cancel_auto_area_detections(self, clear=True):
+        """Cooperatively cancel queued/running automatic-area scans."""
+        with self._auto_area_lock:
+            cancel_event = self._auto_area_cancel_event
+            cancel_event.set()
+            futures = list(self._auto_area_futures.values())
+            manual_entry = self._manual_auto_area_future
+            if manual_entry is not None:
+                futures.append(manual_entry[-1])
+            if clear:
+                self._auto_area_futures.clear()
+                self._auto_area_errors.clear()
+        with self._auto_area_condition:
+            self._auto_area_condition.notify_all()
+        # Future.cancel() can invoke callbacks synchronously; keep it outside
+        # the lock acquired by those callbacks.
+        # A manual request can share a Future with another bookkeeping path in
+        # tests or future refactors.  Avoid invoking cancel twice.
+        futures = list(dict.fromkeys(futures))
+        for future in futures:
+            future.cancel()
+        return futures
+
+    def _wait_for_auto_area_future(self, future):
+        cancel_event = self._auto_area_cancel_event
+        deadline = time.monotonic() + max(
+            0.0,
+            float(getattr(self, "AUTO_AREA_WAIT_TIMEOUT_SECONDS", 120.0)),
+        )
+        while True:
+            if self._stop_event.is_set() or cancel_event.is_set() or self._closing:
+                raise SubtitleDetectionCancelled("Automatic subtitle-area detection cancelled")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                timeout_seconds = float(getattr(
+                    self,
+                    "AUTO_AREA_WAIT_TIMEOUT_SECONDS",
+                    120.0,
+                ))
+                self._disable_auto_area_preprocessing(
+                    f"自动框选超过 {timeout_seconds:g} 秒未响应，已回退默认底部区域；"
+                    "请重启应用以恢复自动框选"
+                )
+                raise TimeoutError("Automatic subtitle-area detection timed out")
+            try:
+                return future.result(timeout=min(0.2, remaining))
+            except FuturesTimeoutError:
+                continue
+
     def _pause_auto_area_preprocessing(self):
         """Prevent detector work from overlapping the active remover process."""
+        timed_out = False
+        deadline = time.monotonic() + max(
+            0.0,
+            float(getattr(self, "AUTO_AREA_WAIT_TIMEOUT_SECONDS", 120.0)),
+        )
         with self._auto_area_condition:
             self._auto_area_preprocessing_paused = True
             while self._auto_area_active_jobs:
-                self._auto_area_condition.wait()
+                if getattr(self, "_auto_area_unhealthy", False):
+                    return
+                if self._stop_event.is_set() or self._closing:
+                    raise SubtitleDetectionCancelled(
+                        "Automatic subtitle-area preprocessing cancelled"
+                    )
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    timed_out = True
+                    break
+                self._auto_area_condition.wait(timeout=min(0.2, remaining))
+        if timed_out:
+            timeout_seconds = float(getattr(
+                self,
+                "AUTO_AREA_WAIT_TIMEOUT_SECONDS",
+                120.0,
+            ))
+            self._disable_auto_area_preprocessing(
+                f"后台自动框选超过 {timeout_seconds:g} 秒未响应，"
+                "已禁用本次会话预扫描并继续处理；请重启应用恢复"
+            )
 
     def _resume_auto_area_preprocessing(self):
         with self._auto_area_condition:
@@ -679,25 +1171,49 @@ class HomeInterface(QWidget):
             return
 
         with self._auto_area_lock:
+            if (
+                self._closing
+                or self._stop_event.is_set()
+                or self._auto_area_unhealthy
+            ):
+                return
+            if self._auto_area_cancel_event.is_set():
+                self._auto_area_cancel_event = threading.Event()
+            cancel_event = self._auto_area_cancel_event
             if video_path in self._auto_area_results or video_path in self._auto_area_futures:
                 return
             self._auto_area_errors.pop(video_path, None)
-            future = self.auto_area_executor.submit(self._run_auto_area_detection, video_path)
+            future = self.auto_area_executor.submit(
+                self._run_auto_area_detection,
+                video_path,
+                cancel_event,
+            )
             self._auto_area_futures[video_path] = future
 
         def _done_callback(done_future):
             try:
                 result = done_future.result()
+            except (CancelledError, SubtitleDetectionCancelled):
+                with self._auto_area_lock:
+                    if self._auto_area_futures.get(video_path) is done_future:
+                        self._auto_area_futures.pop(video_path, None)
+                return
             except Exception as e:
                 with self._auto_area_lock:
-                    self._auto_area_errors[video_path] = str(e)
-                    self._auto_area_futures.pop(video_path, None)
+                    is_registered = self._auto_area_futures.get(video_path) is done_future
+                    if is_registered:
+                        self._auto_area_futures.pop(video_path, None)
+                    if is_registered and not cancel_event.is_set() and not self._closing:
+                        self._auto_area_errors[video_path] = str(e)
                 return
 
             with self._auto_area_lock:
-                self._auto_area_results[video_path] = result
-                self._auto_area_futures.pop(video_path, None)
-                self._auto_area_errors.pop(video_path, None)
+                is_registered = self._auto_area_futures.get(video_path) is done_future
+                if is_registered:
+                    self._auto_area_futures.pop(video_path, None)
+                if is_registered and not cancel_event.is_set() and not self._closing:
+                    self._auto_area_results[video_path] = result
+                    self._auto_area_errors.pop(video_path, None)
 
         future.add_done_callback(_done_callback)
 
@@ -757,6 +1273,7 @@ class HomeInterface(QWidget):
         # holding the lock those callbacks acquire.
         for future in futures:
             future.cancel()
+        return futures
 
     def _reset_subtitle_timeline_prefetch(self):
         self._cancel_subtitle_timeline_prefetch(clear=True)
@@ -1002,6 +1519,14 @@ class HomeInterface(QWidget):
         return preview_areas
 
     def auto_area_button_clicked(self):
+        if config.inpaintMode.value == InpaintMode.FIXED_WATERMARK:
+            self.append_output("固定水印模式请直接在预览中手工框选水印区域")
+            return
+        if getattr(self, "_auto_area_unhealthy", False):
+            self.append_output(
+                "后台自动框选此前未响应，本次会话已禁用；请重启应用后重试"
+            )
+            return
         if not self.video_path:
             self.append_output(tr['SubtitleExtractorGUI']['OpenVideoFirst'])
             return
@@ -1016,23 +1541,162 @@ class HomeInterface(QWidget):
                 return
 
         video_path = self.video_path
+        self._reset_auto_area_cancellation()
         self.append_output("开始自动框选字幕区域...")
+        with self._auto_area_lock:
+            if self._closing or self._executors_shutdown:
+                return
+            self._manual_auto_area_generation += 1
+            request_token = self._manual_auto_area_generation
+            cancel_event = self._auto_area_cancel_event
+            try:
+                future = self.auto_area_executor.submit(
+                    self._run_auto_area_detection,
+                    video_path,
+                    cancel_event,
+                )
+            except RuntimeError as error:
+                if not self._closing:
+                    self.append_output(f"自动框选失败: {error}")
+                return
+            self._manual_auto_area_future = (
+                request_token,
+                current_task_index,
+                video_path,
+                cancel_event,
+                future,
+            )
+
         self.auto_subtitle_area_running_signal.emit(True)
 
-        def task():
+        def _done_callback(done_future):
+            result = None
+            error = None
             try:
-                areas, confidence = self._run_auto_area_detection(video_path)
-                self.auto_subtitle_area_signal.emit(areas, confidence)
-            except Exception as e:
+                result = done_future.result()
+            except (CancelledError, SubtitleDetectionCancelled):
+                pass
+            except Exception as exception:
+                error = exception
                 traceback.print_exc()
-                self.auto_subtitle_area_error_signal.emit(f"自动框选失败: {e}")
-            finally:
-                self.auto_subtitle_area_running_signal.emit(False)
 
-        threading.Thread(target=task, daemon=True).start()
+            # Serialize the final emission gate with shutdown's `_closing`
+            # transition.  Once shutdown acquires this lock no manual result,
+            # error, or button-state signal can be emitted afterwards.
+            with self._worker_lifecycle_lock:
+                with self._auto_area_lock:
+                    entry = self._manual_auto_area_future
+                    is_current = (
+                        entry is not None
+                        and entry[0] == request_token
+                        and entry[-1] is done_future
+                    )
+                    if is_current:
+                        self._manual_auto_area_future = None
+                    should_emit = (
+                        is_current
+                        and not self._closing
+                        and not cancel_event.is_set()
+                        and request_token == self._manual_auto_area_generation
+                    )
 
-    @Slot(list, float)
-    def on_auto_subtitle_area_detected(self, areas, confidence):
+                if should_emit:
+                    if error is not None:
+                        self.auto_subtitle_area_error_signal.emit(
+                            current_task_index,
+                            video_path,
+                            request_token,
+                            f"自动框选失败: {error}",
+                        )
+                    elif result is not None:
+                        areas, confidence = result
+                        self.auto_subtitle_area_signal.emit(
+                            current_task_index,
+                            video_path,
+                            request_token,
+                            areas,
+                            confidence,
+                        )
+                if is_current and not self._closing:
+                    self.auto_subtitle_area_running_signal.emit(False)
+
+        future.add_done_callback(_done_callback)
+
+        def _manual_timeout_monitor():
+            try:
+                future.result(timeout=max(
+                    0.0,
+                    float(self.AUTO_AREA_WAIT_TIMEOUT_SECONDS),
+                ))
+                return
+            except FuturesTimeoutError:
+                pass
+            except BaseException:
+                return
+
+            with self._auto_area_lock:
+                entry = self._manual_auto_area_future
+                is_current = (
+                    entry is not None
+                    and entry[0] == request_token
+                    and entry[-1] is future
+                    and not self._closing
+                )
+                if is_current:
+                    self._manual_auto_area_future = None
+            if not is_current:
+                return
+            self._disable_auto_area_preprocessing(
+                f"自动框选超过 {self.AUTO_AREA_WAIT_TIMEOUT_SECONDS:g} 秒未响应，"
+                "已禁用本次会话自动框选；请重启应用恢复"
+            )
+            self.auto_subtitle_area_error_signal.emit(
+                current_task_index,
+                video_path,
+                request_token,
+                "自动框选超时，请重启应用后重试",
+            )
+            self.auto_subtitle_area_running_signal.emit(False)
+
+        timeout_thread = threading.Thread(
+            target=_manual_timeout_monitor,
+            name="manual-auto-area-timeout",
+            daemon=True,
+        )
+        timeout_thread.start()
+
+    def _manual_auto_area_target_is_current(self, task_index, video_path, request_token):
+        with self._auto_area_lock:
+            if self._closing or request_token != self._manual_auto_area_generation:
+                return False
+        if self.task_list_component.get_current_task_index() != task_index:
+            return False
+        task = self.task_list_component.get_task(task_index)
+        if task is None:
+            return False
+        canonical_target = os.path.normcase(os.path.realpath(os.path.abspath(video_path)))
+        canonical_task = os.path.normcase(os.path.realpath(os.path.abspath(task.path)))
+        current_video = self.video_path
+        if current_video is None:
+            return False
+        canonical_current = os.path.normcase(os.path.realpath(os.path.abspath(current_video)))
+        return canonical_target == canonical_task == canonical_current
+
+    @Slot(int, str, int, list, float)
+    def on_auto_subtitle_area_detected(
+        self,
+        task_index,
+        video_path,
+        request_token,
+        areas,
+        confidence,
+    ):
+        if not self._manual_auto_area_target_is_current(
+            task_index,
+            video_path,
+            request_token,
+        ):
+            return
         if not areas:
             self.append_output("自动框选失败: 未找到可用字幕区域")
             return
@@ -1045,15 +1709,28 @@ class HomeInterface(QWidget):
         self.video_display_component.set_selection_rects(preview_areas)
         self.video_display_component.save_selections_to_config()
 
-        current_task_index = self.task_list_component.get_current_task_index()
-        if current_task_index >= 0:
-            self.task_list_component.update_task_option(current_task_index, TaskOptions.SUB_AREAS, preview_areas)
-            self.task_list_component.update_task_option(current_task_index, TaskOptions.SUB_AREAS_SOURCE, "auto")
+        self.task_list_component.update_task_option(task_index, TaskOptions.SUB_AREAS, preview_areas)
+        self.task_list_component.update_task_option(task_index, TaskOptions.SUB_AREAS_SOURCE, "auto")
 
         if confidence <= 0:
             self.append_output(f"未检测到稳定字幕，已使用默认底部区域: {areas}")
         else:
             self.append_output(f"自动框选完成: {areas}, 置信度 {confidence:.2f}")
+
+    @Slot(int, str, int, str)
+    def on_auto_subtitle_area_error(
+        self,
+        task_index,
+        video_path,
+        request_token,
+        message,
+    ):
+        if self._manual_auto_area_target_is_current(
+            task_index,
+            video_path,
+            request_token,
+        ):
+            self.append_output(message)
 
     def ensure_subtitle_areas_before_run(self, task_index, video_path):
         subtitle_areas = self.task_list_component.get_task_option(task_index, TaskOptions.SUB_AREAS, [])
@@ -1077,26 +1754,61 @@ class HomeInterface(QWidget):
 
                 if result is None and future is not None:
                     self.append_log_signal.emit([f"运行前等待自动框选结果: {os.path.basename(video_path)}"])
-                    detected_areas, confidence = future.result()
+                    detected_areas, confidence = self._wait_for_auto_area_future(future)
                     with self._auto_area_lock:
-                        self._auto_area_results[video_path] = (detected_areas, confidence)
-                        self._auto_area_futures.pop(video_path, None)
-                        self._auto_area_errors.pop(video_path, None)
+                        if (
+                            self._stop_event.is_set()
+                            or self._auto_area_cancel_event.is_set()
+                            or self._closing
+                        ):
+                            raise SubtitleDetectionCancelled(
+                                "Automatic subtitle-area detection cancelled"
+                            )
+                        registered_future = self._auto_area_futures.get(video_path)
+                        cached_result = self._auto_area_results.get(video_path)
+                        if registered_future is future:
+                            self._auto_area_results[video_path] = (
+                                detected_areas,
+                                confidence,
+                            )
+                            self._auto_area_futures.pop(video_path, None)
+                            self._auto_area_errors.pop(video_path, None)
+                        elif cached_result is None:
+                            # The only other path which removes this Future is
+                            # cancellation/clear.  Never resurrect its result.
+                            raise SubtitleDetectionCancelled(
+                                "Automatic subtitle-area detection result is stale"
+                            )
                 elif result is not None:
                     detected_areas, confidence = result
                 else:
                     raise RuntimeError(error or "自动框选失败")
 
-                preview_areas = self._apply_detected_areas_to_task(
-                    task_index,
-                    detected_areas,
-                    confidence,
-                    source="auto",
-                    log_prefix="运行前",
-                )
+                # Stop sets its event while holding this same lifecycle lock.
+                # Keep the final guard and UI/task mutation atomic with that
+                # transition so a stopped run cannot apply a late selection.
+                with self._worker_lifecycle_lock:
+                    if (
+                        self._stop_event.is_set()
+                        or self._auto_area_cancel_event.is_set()
+                        or self._closing
+                    ):
+                        raise SubtitleDetectionCancelled(
+                            "Automatic subtitle-area detection cancelled"
+                        )
+
+                    preview_areas = self._apply_detected_areas_to_task(
+                        task_index,
+                        detected_areas,
+                        confidence,
+                        source="auto",
+                        log_prefix="运行前",
+                    )
                 if preview_areas:
                     return preview_areas
                 self.append_log_signal.emit(["运行前自动框选失败: 未找到可用字幕区域"])
+            except (CancelledError, SubtitleDetectionCancelled):
+                raise
             except Exception as e:
                 traceback.print_exc()
                 self.append_log_signal.emit([f"运行前自动框选失败: {e}"])
@@ -1106,18 +1818,52 @@ class HomeInterface(QWidget):
             return subtitle_areas
         raise RuntimeError("无法建立默认字幕区域")
 
+    def ensure_fixed_watermark_areas_before_run(self, task_index):
+        normalized_areas = self._fixed_watermark_areas_for_task(task_index)
+        if not normalized_areas:
+            raise RuntimeError("固定水印模式必须先在预览中框选水印区域")
+        video_areas = _normalized_areas_to_video(
+            normalized_areas,
+            self.frame_width,
+            self.frame_height,
+        )
+        if not video_areas:
+            raise RuntimeError("固定水印区域无法转换为视频坐标，请重新框选")
+        return video_areas
+
     def run_button_clicked(self):
-        if not self.task_list_component.get_pending_tasks():
+        pending_tasks = self.task_list_component.get_pending_tasks()
+        if not pending_tasks:
             self.append_output(tr['SubtitleExtractorGUI']['OpenVideoFirst'])
             return
 
+        if config.inpaintMode.value == InpaintMode.FIXED_WATERMARK:
+            missing = [
+                task.name
+                for task_index, task in pending_tasks
+                if not self._fixed_watermark_areas_for_task(task_index)
+            ]
+            if missing:
+                self.append_output(
+                    "固定水印模式必须先框选水印区域；未设置: "
+                    + ", ".join(missing[:3])
+                )
+                return
+
         try:
+            with self._worker_lifecycle_lock:
+                if self._closing:
+                    return
+                if self._worker_thread and self._worker_thread.is_alive():
+                    self.append_output("Previous processing task is still stopping; please wait")
+                    return
             # 获取所有待执行的任务
             pending_tasks = self.task_list_component.get_pending_tasks()
             if not pending_tasks:
                 return
 
             self._stop_event.clear()
+            self._reset_auto_area_cancellation()
             self._reset_subtitle_timeline_prefetch()
             self.toggle_buttons_signal.emit(False)
             # 开启后台线程处理视频
@@ -1145,6 +1891,8 @@ class HomeInterface(QWidget):
                             self.current_processing_task_index, task_item = pending_task
                             self._auto_area_prefetch_started_for_task = None
                             self.current_processing_task_start_time = time.time()
+                            if self._stop_event.is_set() or self._closing:
+                                break
                             if not self.load_video(task_item.path):
                                 self.append_log_signal.emit([tr['SubtitleExtractorGUI']['OpenVideoFailed'].format(task_item.path)])
                                 self.task_status_signal.emit(self.current_processing_task_index, TaskStatus.FAILED)
@@ -1158,14 +1906,24 @@ class HomeInterface(QWidget):
                                 )
                                 continue
 
-                            # 获取字幕区域坐标，未选择则使用全屏
-                            subtitle_areas = self.ensure_subtitle_areas_before_run(
-                                self.current_processing_task_index,
-                                task_item.path
-                            )
+                            if config.inpaintMode.value == InpaintMode.FIXED_WATERMARK:
+                                processing_areas = self.ensure_fixed_watermark_areas_before_run(
+                                    self.current_processing_task_index
+                                )
+                            else:
+                                # 获取字幕区域坐标，未选择则使用自动或默认区域
+                                processing_areas = self.ensure_subtitle_areas_before_run(
+                                    self.current_processing_task_index,
+                                    task_item.path
+                                )
+                            if self._stop_event.is_set() or self._closing:
+                                break
                             self._pause_auto_area_preprocessing()
+                            if self._stop_event.is_set() or self._closing:
+                                break
 
-                            self.video_display_component.save_selections_to_config()
+                            if config.inpaintMode.value != InpaintMode.FIXED_WATERMARK:
+                                self.video_display_component.save_selections_to_config()
 
                             # 更新任务状态为运行中
                             self.task_list_component.update_task_progress(self.current_processing_task_index, 1)
@@ -1181,16 +1939,27 @@ class HomeInterface(QWidget):
                             self.task_status_signal.emit(self.current_processing_task_index, TaskStatus.PROCESSING)
                             options = {}
                             for key in task_item.options:
-                                if key == TaskOptions.SUB_AREAS_SOURCE.value:
+                                if key in (
+                                    TaskOptions.SUB_AREAS_SOURCE.value,
+                                    TaskOptions.FIXED_WATERMARK_AREAS.value,
+                                ):
                                     continue
                                 value = task_item.options[key]
                                 if key == TaskOptions.SUB_AREAS.value:
+                                    if config.inpaintMode.value == InpaintMode.FIXED_WATERMARK:
+                                        continue
                                     value = self.video_display_component.preview_coordinates_to_video_coordinates(value)
                                 options[key] = value
+                            if config.inpaintMode.value == InpaintMode.FIXED_WATERMARK:
+                                options[TaskOptions.SUB_AREAS.value] = processing_areas
+                            options["inpaint_mode"] = config.inpaintMode.value
+                            options["output_video_bitrate_kbps"] = config.outputVideoBitrateKbps.value
                             if config.inpaintMode.value == InpaintMode.STTN_DET:
                                 timeline_cache = self._take_subtitle_timeline_cache(task_item.path)
                                 if timeline_cache is not None:
                                     options["subtitle_detection_cache"] = timeline_cache
+                            if self._stop_event.is_set() or self._closing:
+                                break
                             # 清理缓存, 使用动态路径
                             task_item.output_path = None
                             output_path = task_item.output_path
@@ -1228,6 +1997,13 @@ class HomeInterface(QWidget):
                                 )
                                 self.task_status_signal.emit(self.current_processing_task_index, TaskStatus.FAILED)
 
+                        except (CancelledError, SubtitleDetectionCancelled):
+                            if self.current_processing_task_index >= 0 and not self._closing:
+                                self.task_status_signal.emit(
+                                    self.current_processing_task_index,
+                                    TaskStatus.PENDING,
+                                )
+                            break
                         except Exception as e:
                             print(e)
                             self.append_log_signal.emit([f"Error: {e}"])
@@ -1254,10 +2030,17 @@ class HomeInterface(QWidget):
                 finally:
                     self._cancel_subtitle_timeline_prefetch(clear=True)
                     self._resume_auto_area_preprocessing()
-                    self.toggle_buttons_signal.emit(True)
+                    if not self._closing:
+                        self.toggle_buttons_signal.emit(True)
+                    with self._worker_lifecycle_lock:
+                        if self._worker_thread is threading.current_thread():
+                            self._worker_thread = None
 
-            self._worker_thread = threading.Thread(target=task, daemon=True)
-            self._worker_thread.start()
+            with self._worker_lifecycle_lock:
+                if self._closing:
+                    return
+                self._worker_thread = threading.Thread(target=task, daemon=True)
+                self._worker_thread.start()
         except Exception as e:
             print(traceback.format_exc())
             self.append_log_signal.emit([f"Error: {e}"])
@@ -1277,6 +2060,13 @@ class HomeInterface(QWidget):
         sr = None
         try:
             from backend.main import SubtitleRemover
+            options = dict(options)
+            inpaint_mode = options.pop("inpaint_mode", None)
+            if inpaint_mode is not None:
+                config.inpaintMode.value = inpaint_mode
+            output_bitrate = options.pop("output_video_bitrate_kbps", None)
+            if output_bitrate is not None:
+                config.outputVideoBitrateKbps.value = int(output_bitrate)
             sr = SubtitleRemover(video_path, True)
             sr.video_out_path = output_path
             for key in options:
@@ -1312,6 +2102,8 @@ class HomeInterface(QWidget):
     # 修改run_subtitle_remover_process方法
     @staticmethod
     def remover_worker_process(command_queue, queue):
+        process_manager = ProcessManager.instance()
+        _start_parent_death_watchdog(cleanup_func=process_manager.shutdown)
         while True:
             command = command_queue.get()
             if not command:
@@ -1432,9 +2224,19 @@ class HomeInterface(QWidget):
         """更新执行时预览"""
         frame_ori, frame_comp = args
         if self.current_processing_task_index >= 0:
-            subtitle_areas = self.task_list_component.get_task_option(self.current_processing_task_index, TaskOptions.SUB_AREAS, [])
+            if config.inpaintMode.value == InpaintMode.FIXED_WATERMARK:
+                subtitle_areas = _normalized_areas_to_video(
+                    self._fixed_watermark_areas_for_task(
+                        self.current_processing_task_index
+                    ),
+                    frame_ori.shape[1],
+                    frame_ori.shape[0],
+                )
+            else:
+                subtitle_areas = self.task_list_component.get_task_option(self.current_processing_task_index, TaskOptions.SUB_AREAS, [])
+                if len(subtitle_areas) > 0:
+                    subtitle_areas = self.video_display_component.preview_coordinates_to_video_coordinates(subtitle_areas)
             if len(subtitle_areas) > 0:
-                subtitle_areas = self.video_display_component.preview_coordinates_to_video_coordinates(subtitle_areas)
                 if frame_ori is frame_comp:
                     frame_ori = frame_ori.copy()
                 for rect in subtitle_areas:
@@ -1454,6 +2256,8 @@ class HomeInterface(QWidget):
             self.task_list_component.update_task_status(self.current_processing_task_index, TaskStatus.FAILED)
 
     def load_video(self, video_path):
+        if getattr(self, "_closing", False):
+            return False
         self.video_path = video_path
         with self._video_cap_lock:
             if self.video_cap:
@@ -1465,6 +2269,7 @@ class HomeInterface(QWidget):
         with self._video_cap_lock:
             self.video_cap = cv2.VideoCapture(get_readable_path(self.video_path))
             if not self.video_cap.isOpened():
+                self.video_cap.release()
                 self.video_cap = None
                 return self.load_as_picture(video_path)
             ret, frame = self.video_cap.read()
@@ -1668,18 +2473,71 @@ class HomeInterface(QWidget):
                 self.append_output(f"检测到已处理完成，跳过重复执行: {path}")
             self.task_list_component.select_task(index)
 
+    def shutdown_workers(self, join_timeout=5):
+        """Stop background work and permanently prevent worker recreation.
+
+        Setting ``_closing`` and ``_stop_event`` under the lifecycle lock is
+        the important ordering guarantee: a processing thread that wakes while
+        the window is closing can no longer publish a replacement worker.
+        """
+        with self._worker_lifecycle_lock:
+            self._closing = True
+            self._stop_event.set()
+            worker_thread = self._worker_thread
+
+        deadline = time.monotonic() + max(0.0, float(join_timeout))
+
+        auto_area_futures = self._cancel_auto_area_detections(clear=True)
+        timeline_futures = self._cancel_subtitle_timeline_prefetch(clear=True)
+        self._resume_auto_area_preprocessing()
+        self._dispose_subtitle_worker(terminate=True)
+
+        # The parent window owns this child widget, so closing the parent does
+        # not deliver HomeInterface.closeEvent.  Release the preview decoder as
+        # part of the idempotent shutdown entry point itself.
+        with self._video_cap_lock:
+            if self.video_cap:
+                self.video_cap.release()
+                self.video_cap = None
+
+        if (
+            worker_thread
+            and worker_thread is not threading.current_thread()
+            and worker_thread.is_alive()
+        ):
+            worker_thread.join(timeout=max(0.0, deadline - time.monotonic()))
+        background_futures = list(dict.fromkeys(
+            list(auto_area_futures or []) + list(timeline_futures or [])
+        ))
+        if background_futures:
+            wait_futures(
+                background_futures,
+                timeout=max(0.0, deadline - time.monotonic()),
+            )
+
+        # A processing thread which was already between its loop guard and
+        # load_video() when shutdown began may have briefly reopened a decoder.
+        # The closing gate prevents later opens; this second pass closes that
+        # final race without extending the bounded wait.
+        with self._video_cap_lock:
+            if self.video_cap:
+                self.video_cap.release()
+                self.video_cap = None
+
+        # Defensive second pass: even if a legacy code path had already been
+        # inside worker construction, the closing gate prevents another one.
+        self._dispose_subtitle_worker(terminate=True)
+
+        with self._worker_lifecycle_lock:
+            if not self._executors_shutdown:
+                self._executors_shutdown = True
+                self.auto_area_executor.shutdown(wait=False, cancel_futures=True)
+                self.subtitle_timeline_executor.shutdown(wait=False, cancel_futures=True)
+
     def closeEvent(self, event):
         """窗口关闭时断开信号连接并清理资源"""
         try:
-            # 通知 worker 线程停止
-            self._stop_event.set()
-            self._cancel_subtitle_timeline_prefetch(clear=True)
-            # 终止子进程
-            self._dispose_subtitle_worker(terminate=False)
-            ProcessManager.instance().terminate_all()
-            # 等待 worker 线程结束（最多5秒）
-            if self._worker_thread and self._worker_thread.is_alive():
-                self._worker_thread.join(timeout=5)
+            self.shutdown_workers()
 
             # 断开信号连接
             self.progress_signal.disconnect(self.update_progress)
@@ -1690,9 +2548,6 @@ class HomeInterface(QWidget):
             self.video_display_component.video_slider.valueChanged.disconnect(self.slider_changed)
             self.video_display_component.ab_sections_changed.disconnect(self.ab_sections_changed)
             self.video_display_component.selections_changed.disconnect(self.selections_changed)
-            self._resume_auto_area_preprocessing()
-            self.auto_area_executor.shutdown(wait=False, cancel_futures=True)
-            self.subtitle_timeline_executor.shutdown(wait=False, cancel_futures=True)
             # 释放视频资源
             with self._video_cap_lock:
                 if self.video_cap:

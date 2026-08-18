@@ -33,6 +33,7 @@ class TaskOptions(Enum):
     AB_SECTIONS = "ab_sections"
     SUB_AREAS = "sub_areas"
     SUB_AREAS_SOURCE = "sub_areas_source"
+    FIXED_WATERMARK_AREAS = "fixed_watermark_areas"
 
 
 def _format_elapsed(seconds):
@@ -117,7 +118,7 @@ class TaskListComponent(QWidget):
             tr["TaskList"]["Progress"],
             tr["TaskList"]["Status"],
             "总耗时",
-            "去字幕耗时",
+            "处理耗时",
         ])
         self.table.setShowGrid(False)
         self.table.setAlternatingRowColors(True)

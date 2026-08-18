@@ -689,63 +689,73 @@ def _cluster_by_y_center(boxes, tolerance):
     return clusters
 
 
-def auto_detect_subtitle_area(video_path, sample_count=36, bottom_start_ratio=0.52):
+def auto_detect_subtitle_area(
+    video_path,
+    sample_count=36,
+    bottom_start_ratio=0.52,
+    cancel_event=None,
+):
     """
     Detect a stable subtitle candidate area by sampling frames and clustering OCR text boxes.
 
     Returns:
         (areas, confidence): areas use the project format [(ymin, ymax, xmin, xmax)].
     """
+    if cancel_event is not None and cancel_event.is_set():
+        raise SubtitleDetectionCancelled("Automatic subtitle-area detection cancelled")
+
     cap = cv2.VideoCapture(get_readable_path(video_path))
-    if not cap.isOpened():
-        return [], 0.0
+    try:
+        if not cap.isOpened():
+            return [], 0.0
 
-    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-    frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
-    frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
-    if frame_width <= 0 or frame_height <= 0:
+        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+        frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+        if frame_width <= 0 or frame_height <= 0:
+            return [], 0.0
+
+        bottom_y = int(frame_height * bottom_start_ratio)
+        search_area = [(bottom_y, frame_height, 0, frame_width)]
+        detector = SubtitleDetect(video_path, search_area)
+
+        if frame_count <= 1:
+            frame_indexes = [0]
+        else:
+            sample_count = max(1, min(sample_count, frame_count))
+            frame_indexes = sorted(set(int(i) for i in np.linspace(0, frame_count - 1, sample_count)))
+
+        candidate_boxes = []
+        hit_frames = 0
+        for frame_index in frame_indexes:
+            if cancel_event is not None and cancel_event.is_set():
+                raise SubtitleDetectionCancelled("Automatic subtitle-area detection cancelled")
+            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
+            ret, frame = cap.read()
+            if not ret or frame is None:
+                continue
+
+            frame_boxes = []
+            for xmin, xmax, ymin, ymax in detector.detect_subtitle(frame):
+                width = xmax - xmin
+                height = ymax - ymin
+                if width <= 0 or height <= 0:
+                    continue
+                if ymin < bottom_y:
+                    continue
+                if width < frame_width * 0.08:
+                    continue
+                if height > frame_height * 0.18:
+                    continue
+                if height > width:
+                    continue
+                frame_boxes.append((xmin, xmax, ymin, ymax))
+
+            if frame_boxes:
+                hit_frames += 1
+                candidate_boxes.extend(frame_boxes)
+    finally:
         cap.release()
-        return [], 0.0
-
-    bottom_y = int(frame_height * bottom_start_ratio)
-    search_area = [(bottom_y, frame_height, 0, frame_width)]
-    detector = SubtitleDetect(video_path, search_area)
-
-    if frame_count <= 1:
-        frame_indexes = [0]
-    else:
-        sample_count = max(1, min(sample_count, frame_count))
-        frame_indexes = sorted(set(int(i) for i in np.linspace(0, frame_count - 1, sample_count)))
-
-    candidate_boxes = []
-    hit_frames = 0
-    for frame_index in frame_indexes:
-        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
-        ret, frame = cap.read()
-        if not ret or frame is None:
-            continue
-
-        frame_boxes = []
-        for xmin, xmax, ymin, ymax in detector.detect_subtitle(frame):
-            width = xmax - xmin
-            height = ymax - ymin
-            if width <= 0 or height <= 0:
-                continue
-            if ymin < bottom_y:
-                continue
-            if width < frame_width * 0.08:
-                continue
-            if height > frame_height * 0.18:
-                continue
-            if height > width:
-                continue
-            frame_boxes.append((xmin, xmax, ymin, ymax))
-
-        if frame_boxes:
-            hit_frames += 1
-            candidate_boxes.extend(frame_boxes)
-
-    cap.release()
     if not candidate_boxes:
         fallback = get_default_subtitle_area(frame_width, frame_height)
         return ([fallback] if fallback else []), 0.0

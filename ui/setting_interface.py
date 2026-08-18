@@ -56,6 +56,15 @@ class SettingInterface(QtWidgets.QVBoxLayout):
         )
         self.addWidget(self.auto_subtitle_area_selection)
 
+        self.output_video_bitrate = RangeSettingCard(
+            configItem=config.outputVideoBitrateKbps,
+            icon=FluentIcon.SPEED_HIGH,
+            title=tr["Setting"]["OutputVideoBitrate"],
+            content=tr["Setting"]["OutputVideoBitrateDesc"],
+            parent=parent,
+        )
+        self.addWidget(self.output_video_bitrate)
+
         # 是否启用硬件加速
         self.hardware_acceleration = SwitchSettingCard(
             configItem=config.hardwareAcceleration,
@@ -77,6 +86,11 @@ class SettingInterface(QtWidgets.QVBoxLayout):
     def set_inpaint_mode_enabled(self, enabled):
         """启用或禁用 inpaint 模式下拉框"""
         self.inpaint_mode_combo.comboBox.setEnabled(enabled)
+
+    def set_subtitle_controls_enabled(self, enabled):
+        """固定水印模式不需要字幕检测或自动框选设置。"""
+        self.subtitle_detect_model_combo.setEnabled(enabled)
+        self.auto_subtitle_area_selection.setEnabled(enabled)
 
     def reset_setting(self):
         """重置所有设置为默认值"""

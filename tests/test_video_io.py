@@ -106,6 +106,8 @@ class FFmpegVideoWriterTests(unittest.TestCase):
         hidden_kwargs=None,
         returncode=0,
         terminate_requires_kill=False,
+        process_manager=None,
+        bitrate_kbps=4500,
     ):
         stdin = stdin or _FakeStdin()
         process = _FakeProcess(
@@ -130,23 +132,52 @@ class FFmpegVideoWriterTests(unittest.TestCase):
             'hidden_subprocess_kwargs',
             return_value=hidden_kwargs,
         )
+        if process_manager is None:
+            process_manager = mock.Mock()
+            process_manager.add_process.return_value = 'ffmpeg-writer-test'
+        manager = mock.patch.object(
+            video_io.ProcessManager,
+            'instance',
+            return_value=process_manager,
+        )
         popen_mock = popen.start()
         ffmpeg.start()
         hidden.start()
+        manager.start()
         self.addCleanup(popen.stop)
         self.addCleanup(ffmpeg.stop)
         self.addCleanup(hidden.stop)
+        self.addCleanup(manager.stop)
+        self._last_process = process
+        self._last_process_manager = process_manager
         writer = video_io.FFmpegVideoWriter(
             'out.mp4',
             30,
             (2, 2),
             queue_size=queue_size,
+            bitrate_kbps=bitrate_kbps,
         )
         return writer, process, popen_mock
 
     @staticmethod
     def _frame(value):
         return np.full((2, 2, 3), value, dtype=np.uint8)
+
+    def test_configured_bitrate_is_passed_to_ffmpeg(self):
+        writer, _, popen = self._create_writer(bitrate_kbps=6789)
+        self.addCleanup(writer.release)
+
+        command = popen.call_args.args[0]
+        self.assertEqual(command[command.index('-b:v') + 1], '6789k')
+        self.assertEqual(command[command.index('-minrate') + 1], '6789k')
+        self.assertEqual(command[command.index('-maxrate') + 1], '6789k')
+        self.assertEqual(command[command.index('-bufsize') + 1], '13578k')
+        self.assertNotIn('-crf', command)
+        self.assertEqual(writer.bitrate_kbps, 6789)
+
+    def test_invalid_bitrate_is_rejected_before_starting_ffmpeg(self):
+        with self.assertRaisesRegex(ValueError, 'bitrate_kbps'):
+            video_io.FFmpegVideoWriter('out.mp4', 30, (2, 2), bitrate_kbps=0)
 
     def test_writes_frames_in_order_and_release_waits_for_all_frames(self):
         stdin = _BlockingStdin()
@@ -182,6 +213,69 @@ class FFmpegVideoWriterTests(unittest.TestCase):
         self.assertEqual(len(process.wait_calls), 1)
         self.assertGreater(process.wait_calls[0], 599)
         self.assertLessEqual(process.wait_calls[0], 600)
+
+    def test_registers_process_until_successful_release(self):
+        writer, process, _ = self._create_writer()
+        manager = self._last_process_manager
+
+        manager.add_process.assert_called_once_with(
+            process,
+        )
+        manager.remove_process.assert_not_called()
+
+        writer.release()
+        writer.release()
+
+        manager.remove_process.assert_called_once_with('ffmpeg-writer-test')
+
+    def test_registration_rejected_during_shutdown_stops_process_and_raises(self):
+        manager = mock.Mock()
+        manager.add_process.return_value = None
+
+        with self.assertRaisesRegex(RuntimeError, 'shutdown is in progress'):
+            self._create_writer(process_manager=manager)
+
+        process = self._last_process
+        manager.add_process.assert_called_once_with(
+            process,
+        )
+        self.assertEqual(process.terminate_calls, 1)
+        self.assertEqual(process.kill_calls, 0)
+        self.assertEqual(len(process.wait_calls), 1)
+        manager.remove_process.assert_not_called()
+
+    def test_constructor_failure_after_registration_stops_and_unregisters(self):
+        manager = mock.Mock()
+        manager.add_process.return_value = 'registered-before-thread-start'
+
+        with (
+            mock.patch.object(
+                video_io.threading.Thread,
+                'start',
+                side_effect=RuntimeError('thread start failed'),
+            ),
+            self.assertRaisesRegex(RuntimeError, 'thread start failed'),
+        ):
+            self._create_writer(process_manager=manager)
+
+        process = self._last_process
+        self.assertEqual(process.terminate_calls, 1)
+        self.assertEqual(len(process.wait_calls), 1)
+        manager.remove_process.assert_called_once_with(
+            'registered-before-thread-start'
+        )
+
+    def test_live_process_keeps_registration_for_shutdown_retry(self):
+        writer, process, _ = self._create_writer()
+        manager = self._last_process_manager
+        process.poll = mock.Mock(return_value=None)
+
+        self.assertFalse(writer._unregister_process())
+        manager.remove_process.assert_not_called()
+
+        process.poll.return_value = 0
+        self.assertTrue(writer._unregister_process())
+        manager.remove_process.assert_called_once_with('ffmpeg-writer-test')
 
     def test_queue_is_bounded_and_applies_backpressure(self):
         stdin = _BlockingStdin()
@@ -234,8 +328,14 @@ class FFmpegVideoWriterTests(unittest.TestCase):
         self.assertEqual(process.terminate_calls, 1)
         self.assertEqual(process.kill_calls, 1)
         self.assertFalse(writer._writer_thread.is_alive())
+        self._last_process_manager.remove_process.assert_called_once_with(
+            'ffmpeg-writer-test'
+        )
         with self.assertRaisesRegex(TimeoutError, 'accept a video frame'):
             writer.release()
+        self._last_process_manager.remove_process.assert_called_once_with(
+            'ffmpeg-writer-test'
+        )
 
     def test_release_timeout_force_stops_blocked_writer(self):
         stdin = _BlockingStdin()
@@ -364,11 +464,13 @@ class FFmpegVideoWriterTests(unittest.TestCase):
 
     def test_release_reports_nonzero_ffmpeg_exit_code(self):
         writer, _, _ = self._create_writer(returncode=7)
+        manager = self._last_process_manager
 
         with self.assertRaisesRegex(RuntimeError, 'exited with code 7'):
             writer.release()
         with self.assertRaisesRegex(RuntimeError, 'exited with code 7'):
             writer.release()
+        manager.remove_process.assert_called_once_with('ffmpeg-writer-test')
 
     def test_write_after_release_fails(self):
         writer, _, _ = self._create_writer()

@@ -41,11 +41,14 @@ class Config(QConfig):
     # 使用一个配置项存储所有选区
     # 默认值为一个选区，格式为："ymin,ymax,xmin,xmax;ymin,ymax,xmin,xmax;..."，分号分隔不同选区
     subtitleSelectionAreas = ConfigItem("Main", "SubtitleSelectionAreas", "0.88,0.99,0.15,0.85")
+    # 固定水印使用独立的归一化视频坐标，避免覆盖字幕框选。
+    fixedWatermarkSelectionAreas = ConfigItem("Main", "FixedWatermarkSelectionAreas", "")
 
     """
     MODE可选算法类型
     - InpaintMode.STTN_AUTO 智能擦除版
     - InpaintMode.STTN_DET 带字幕检测版, 无智能擦除
+    - InpaintMode.FIXED_WATERMARK 固定水印局部时序修复
     - InpaintMode.LAMA 算法：对于动画类视频效果好，速度一般，不可以跳过字幕检测
     - InpaintMode.PROPAINTER 算法： 需要消耗大量显存，速度较慢，对运动非常剧烈的视频效果较好
     """
@@ -102,6 +105,13 @@ class Config(QConfig):
     # 是否使用硬件加速
     hardwareAcceleration = ConfigItem("Main", "HardwareAcceleration", HARDWARD_ACCELERATION_OPTION, BoolValidator())
     autoSubtitleAreaSelection = ConfigItem("Main", "AutoSubtitleAreaSelection", False, BoolValidator())
+    # 生成视频的目标码率，单位 kbps（4500 kbps = 4.5 Mbps）。
+    outputVideoBitrateKbps = RangeConfigItem(
+        "Main",
+        "OutputVideoBitrateKbps",
+        4500,
+        RangeValidator(500, 50000),
+    )
     
     # 启动时检查应用更新
     checkUpdateOnStartup = ConfigItem("Main", "CheckUpdateOnStartup", True, BoolValidator())

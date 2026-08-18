@@ -8,7 +8,12 @@ from unittest import mock
 import numpy as np
 
 from backend.tools import subtitle_detect
-from backend.tools.subtitle_detect import SubtitleDetect, get_default_subtitle_area
+from backend.tools.subtitle_detect import (
+    SubtitleDetect,
+    SubtitleDetectionCancelled,
+    auto_detect_subtitle_area,
+    get_default_subtitle_area,
+)
 from ui import home_interface
 from ui.component.task_list_component import TaskOptions
 from ui.home_interface import HomeInterface, _are_normalized_preview_areas
@@ -281,8 +286,16 @@ class AutoSubtitleAreaTests(unittest.TestCase):
     def _make_preprocessing_coordinator(paused=False):
         fake_home = types.SimpleNamespace(
             _auto_area_condition=threading.Condition(),
+            _auto_area_lock=threading.Lock(),
             _auto_area_preprocessing_paused=paused,
             _auto_area_active_jobs=0,
+            _auto_area_cancel_event=threading.Event(),
+            _auto_area_futures={},
+            _auto_area_errors={},
+            _auto_area_results={},
+            _manual_auto_area_future=None,
+            _stop_event=threading.Event(),
+            _closing=False,
         )
         fake_home._run_auto_area_detection = types.MethodType(
             HomeInterface._run_auto_area_detection,
@@ -302,7 +315,7 @@ class AutoSubtitleAreaTests(unittest.TestCase):
         fake_home = self._make_preprocessing_coordinator(paused=True)
         detector_started = threading.Event()
 
-        def detect(video_path):
+        def detect(video_path, **_kwargs):
             detector_started.set()
             return [video_path], 1.0
 
@@ -324,7 +337,7 @@ class AutoSubtitleAreaTests(unittest.TestCase):
         detector_started = threading.Event()
         release_detector = threading.Event()
 
-        def detect(_video_path):
+        def detect(_video_path, **_kwargs):
             detector_started.set()
             release_detector.wait(timeout=1)
             return [], 0.0
@@ -343,6 +356,181 @@ class AutoSubtitleAreaTests(unittest.TestCase):
 
         self.assertTrue(fake_home._auto_area_preprocessing_paused)
         self.assertEqual(fake_home._auto_area_active_jobs, 0)
+
+    def test_paused_background_detection_is_cancelled_without_running(self):
+        fake_home = self._make_preprocessing_coordinator(paused=True)
+        detector = mock.Mock()
+
+        with mock.patch.object(home_interface, "auto_detect_subtitle_area", detector):
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(fake_home._run_auto_area_detection, "episode.mp4")
+                time.sleep(0.05)
+                fake_home._auto_area_cancel_event.set()
+                with fake_home._auto_area_condition:
+                    fake_home._auto_area_condition.notify_all()
+                with self.assertRaises(SubtitleDetectionCancelled):
+                    future.result(timeout=1)
+
+        detector.assert_not_called()
+        self.assertEqual(fake_home._auto_area_active_jobs, 0)
+
+    def test_wait_for_auto_area_future_polls_stop_event(self):
+        fake_home = self._make_preprocessing_coordinator()
+        fake_home._stop_event.set()
+        future = mock.Mock()
+
+        with self.assertRaises(SubtitleDetectionCancelled):
+            HomeInterface._wait_for_auto_area_future(fake_home, future)
+
+        future.result.assert_not_called()
+
+    def test_auto_area_cancellation_cancels_futures_outside_lock(self):
+        fake_home = self._make_preprocessing_coordinator()
+        future = mock.Mock()
+        manual_future = mock.Mock()
+        fake_home._auto_area_futures["episode.mp4"] = future
+        fake_home._manual_auto_area_future = (
+            1,
+            0,
+            "manual.mp4",
+            fake_home._auto_area_cancel_event,
+            manual_future,
+        )
+
+        cancelled = HomeInterface._cancel_auto_area_detections(fake_home, clear=True)
+
+        self.assertTrue(fake_home._auto_area_cancel_event.is_set())
+        future.cancel.assert_called_once_with()
+        manual_future.cancel.assert_called_once_with()
+        self.assertEqual(cancelled, [future, manual_future])
+        self.assertEqual(fake_home._auto_area_futures, {})
+
+    def test_cancelled_auto_area_wait_does_not_apply_fallback(self):
+        future = mock.Mock()
+        fallback = mock.Mock()
+        fake_home = types.SimpleNamespace(
+            task_list_component=types.SimpleNamespace(
+                get_task_option=lambda *_args: [],
+                update_task_option=mock.Mock(),
+            ),
+            _task_needs_auto_area=lambda *_args: True,
+            _get_auto_area_detection_result=lambda _path: (None, future, None),
+            _schedule_auto_area_detection=mock.Mock(),
+            _wait_for_auto_area_future=mock.Mock(
+                side_effect=SubtitleDetectionCancelled("cancelled")
+            ),
+            _apply_detected_areas_to_task=mock.Mock(),
+            _apply_default_subtitle_area_to_task=fallback,
+            append_log_signal=types.SimpleNamespace(emit=mock.Mock()),
+        )
+
+        with self.assertRaises(SubtitleDetectionCancelled):
+            HomeInterface.ensure_subtitle_areas_before_run(
+                fake_home,
+                0,
+                "episode.mp4",
+            )
+
+        fallback.assert_not_called()
+        fake_home._apply_detected_areas_to_task.assert_not_called()
+
+    def test_stop_during_future_completion_cannot_resurrect_result(self):
+        future = mock.Mock()
+        stop_event = threading.Event()
+        results = {}
+        futures = {"episode.mp4": future}
+
+        def finish_after_stop(_future):
+            stop_event.set()
+            futures.clear()
+            return ([(72, 95, 5, 95)], 1.0)
+
+        fake_home = types.SimpleNamespace(
+            task_list_component=types.SimpleNamespace(
+                get_task_option=lambda *_args: [],
+                update_task_option=mock.Mock(),
+            ),
+            _task_needs_auto_area=lambda *_args: True,
+            _get_auto_area_detection_result=lambda _path: (None, future, None),
+            _schedule_auto_area_detection=mock.Mock(),
+            _wait_for_auto_area_future=finish_after_stop,
+            _auto_area_lock=threading.Lock(),
+            _auto_area_results=results,
+            _auto_area_futures=futures,
+            _auto_area_errors={},
+            _auto_area_cancel_event=threading.Event(),
+            _stop_event=stop_event,
+            _closing=False,
+            _apply_detected_areas_to_task=mock.Mock(),
+            _apply_default_subtitle_area_to_task=mock.Mock(),
+            append_log_signal=types.SimpleNamespace(emit=mock.Mock()),
+        )
+
+        with self.assertRaises(SubtitleDetectionCancelled):
+            HomeInterface.ensure_subtitle_areas_before_run(
+                fake_home,
+                0,
+                "episode.mp4",
+            )
+
+        self.assertEqual(results, {})
+        fake_home._apply_detected_areas_to_task.assert_not_called()
+
+    def test_manual_auto_area_result_is_discarded_after_task_switch(self):
+        display = types.SimpleNamespace(
+            video_coordinates_to_preview_coordinates=mock.Mock(),
+            set_selection_rects=mock.Mock(),
+            save_selections_to_config=mock.Mock(),
+        )
+        fake_home = types.SimpleNamespace(
+            _auto_area_lock=threading.Lock(),
+            _closing=False,
+            _manual_auto_area_generation=7,
+            video_path="episode-b.mp4",
+            task_list_component=types.SimpleNamespace(
+                get_current_task_index=lambda: 2,
+                get_task=mock.Mock(),
+                update_task_option=mock.Mock(),
+            ),
+            video_display_component=display,
+            append_output=mock.Mock(),
+        )
+        fake_home._manual_auto_area_target_is_current = types.MethodType(
+            HomeInterface._manual_auto_area_target_is_current,
+            fake_home,
+        )
+
+        HomeInterface.on_auto_subtitle_area_detected(
+            fake_home,
+            1,
+            "episode-a.mp4",
+            7,
+            [(72, 95, 5, 95)],
+            1.0,
+        )
+
+        display.video_coordinates_to_preview_coordinates.assert_not_called()
+        fake_home.task_list_component.update_task_option.assert_not_called()
+
+    def test_unopened_preview_capture_is_explicitly_released(self):
+        capture = mock.Mock()
+        capture.isOpened.return_value = False
+        fake_home = types.SimpleNamespace(
+            video_path=None,
+            video_cap=None,
+            _video_cap_lock=threading.Lock(),
+            load_as_picture=mock.Mock(return_value=False),
+        )
+
+        with (
+            mock.patch.object(home_interface, "is_image_file", return_value=False),
+            mock.patch.object(home_interface, "get_readable_path", side_effect=lambda path: path),
+            mock.patch.object(home_interface.cv2, "VideoCapture", return_value=capture),
+        ):
+            self.assertFalse(HomeInterface.load_video(fake_home, "episode.mp4"))
+
+        capture.release.assert_called_once_with()
+        self.assertIsNone(fake_home.video_cap)
 
     def test_next_episode_prefetch_waits_for_sttn_detection_stage(self):
         fake_home = types.SimpleNamespace(
@@ -438,6 +626,65 @@ class AutoSubtitleAreaTests(unittest.TestCase):
         self.assertEqual(area, (921, 1216, 36, 684))
         self.assertNotEqual(area, (0, 1280, 0, 720))
         self.assertLess(area[1] - area[0], 1280 * 0.3)
+
+    def test_auto_area_cancel_releases_video_capture(self):
+        cancel_event = threading.Event()
+        frame = np.zeros((100, 200, 3), dtype=np.uint8)
+        capture = mock.Mock()
+        capture.isOpened.return_value = True
+
+        def get_property(prop):
+            values = {
+                subtitle_detect.cv2.CAP_PROP_FRAME_COUNT: 3,
+                subtitle_detect.cv2.CAP_PROP_FRAME_WIDTH: 200,
+                subtitle_detect.cv2.CAP_PROP_FRAME_HEIGHT: 100,
+            }
+            return values.get(prop, 0)
+
+        capture.get.side_effect = get_property
+        capture.read.return_value = (True, frame)
+        detector = mock.Mock()
+
+        def detect(_frame):
+            cancel_event.set()
+            return []
+
+        detector.detect_subtitle.side_effect = detect
+        with (
+            mock.patch.object(subtitle_detect.cv2, "VideoCapture", return_value=capture),
+            mock.patch.object(subtitle_detect, "SubtitleDetect", return_value=detector),
+            self.assertRaises(SubtitleDetectionCancelled),
+        ):
+            auto_detect_subtitle_area(
+                "episode.mp4",
+                sample_count=3,
+                cancel_event=cancel_event,
+            )
+
+        capture.release.assert_called_once_with()
+        detector.detect_subtitle.assert_called_once()
+
+    def test_auto_area_detector_error_releases_video_capture(self):
+        frame = np.zeros((100, 200, 3), dtype=np.uint8)
+        capture = mock.Mock()
+        capture.isOpened.return_value = True
+        capture.get.side_effect = lambda prop: {
+            subtitle_detect.cv2.CAP_PROP_FRAME_COUNT: 1,
+            subtitle_detect.cv2.CAP_PROP_FRAME_WIDTH: 200,
+            subtitle_detect.cv2.CAP_PROP_FRAME_HEIGHT: 100,
+        }.get(prop, 0)
+        capture.read.return_value = (True, frame)
+        detector = mock.Mock()
+        detector.detect_subtitle.side_effect = RuntimeError("OCR failed")
+
+        with (
+            mock.patch.object(subtitle_detect.cv2, "VideoCapture", return_value=capture),
+            mock.patch.object(subtitle_detect, "SubtitleDetect", return_value=detector),
+            self.assertRaisesRegex(RuntimeError, "OCR failed"),
+        ):
+            auto_detect_subtitle_area("episode.mp4", sample_count=1)
+
+        capture.release.assert_called_once_with()
 
     def test_pixel_coordinates_are_not_valid_preview_coordinates(self):
         self.assertFalse(_are_normalized_preview_areas([(0, 1280, 0, 720)]))

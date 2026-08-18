@@ -385,6 +385,10 @@ test*_no_sub*.mp4
 !/tests/test_sttn_cuda_optimizations.py
 !/tests/test_video_io.py
 !/tests/test_subtitle_timeline_prefetch.py
+!/tests/test_sttn_interval_streaming.py
+!/tests/test_worker_lifecycle.py
+!/tests/test_fixed_watermark_inpaint.py
+!/tests/test_fixed_watermark_mode.py
 inference.onnx
 /config/config.json
 

@@ -91,7 +91,15 @@ class SubtitleExtractorGUI(FluentWindow):
     def closeEvent(self, event):
         """程序关闭时保存窗口位置并清理资源"""
         self.save_window_position()
-        ProcessManager.instance().terminate_all()
+        process_manager = ProcessManager.instance()
+        # Reject late registrations before asking the background processing
+        # thread to stop.  This closes the race where it could create a new
+        # persistent worker after the first cleanup pass.
+        process_manager.begin_shutdown()
+        try:
+            self.homeInterface.shutdown_workers()
+        finally:
+            process_manager.terminate_all()
         super().closeEvent(event)
 
     def _onThemeChangedFinished(self):

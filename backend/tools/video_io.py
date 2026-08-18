@@ -7,6 +7,7 @@ import cv2
 import numpy as np
 
 from .ffmpeg_cli import FFmpegCLI
+from .process_manager import ProcessManager
 from .subprocess_utils import hidden_subprocess_kwargs
 
 
@@ -64,8 +65,13 @@ class FFmpegVideoWriter:
     _FORCE_STOP_TIMEOUT_SECONDS = 5.0
     _STOP = object()
 
-    def __init__(self, output_path, fps, size, queue_size=16):
+    def __init__(self, output_path, fps, size, queue_size=16, bitrate_kbps=4500):
         w, h = size
+        bitrate_kbps = int(bitrate_kbps)
+        if bitrate_kbps < 1:
+            raise ValueError('bitrate_kbps must be at least 1')
+        bitrate = f'{bitrate_kbps}k'
+        buffer_size = f'{bitrate_kbps * 2}k'
         cmd = [
             FFmpegCLI.instance().ffmpeg_path,
             '-y',
@@ -77,7 +83,10 @@ class FFmpegVideoWriter:
             '-i', '-',
             '-c:v', 'libx264',
             '-pix_fmt', 'yuv420p',
-            '-crf', '18',
+            '-b:v', bitrate,
+            '-minrate', bitrate,
+            '-maxrate', bitrate,
+            '-bufsize', buffer_size,
             '-preset', 'fast',
             '-loglevel', 'error',
             output_path
@@ -90,12 +99,16 @@ class FFmpegVideoWriter:
         self._release_complete = False
         self._release_error = None
         self._output_path = output_path
+        self.bitrate_kbps = bitrate_kbps
         self._writer_error = None
         self._writer_error_event = threading.Event()
         # Serializes frame/sentinel insertion. This keeps a concurrent release
         # from placing the sentinel before a write that has already started.
         self._enqueue_lock = threading.Lock()
         self._release_lock = threading.Lock()
+        self._process_registration_lock = threading.Lock()
+        self._process_manager = None
+        self._process_registration_id = None
         self._frame_queue = queue.Queue(maxsize=queue_size)
         self._process = subprocess.Popen(
             cmd,
@@ -105,19 +118,32 @@ class FFmpegVideoWriter:
             **hidden_subprocess_kwargs(),
         )
 
-        if self._process.stdin is None:
-            try:
-                self._process.terminate()
-            except OSError:
-                pass
-            raise RuntimeError('FFmpeg video writer has no input pipe')
+        try:
+            self._process_manager = ProcessManager.instance()
+            self._process_registration_id = self._process_manager.add_process(
+                self._process,
+            )
+            if self._process_registration_id is None:
+                raise RuntimeError(
+                    'Cannot start FFmpeg video writer while application '
+                    'shutdown is in progress'
+                )
 
-        self._writer_thread = threading.Thread(
-            target=self._write_loop,
-            name='ffmpeg-video-writer',
-            daemon=True,
-        )
-        self._writer_thread.start()
+            if self._process.stdin is None:
+                raise RuntimeError('FFmpeg video writer has no input pipe')
+
+            self._writer_thread = threading.Thread(
+                target=self._write_loop,
+                name='ffmpeg-video-writer',
+                daemon=True,
+            )
+            self._writer_thread.start()
+        except BaseException:
+            # Popen already succeeded, so a shutdown-registration race or any
+            # later constructor failure must not leave an orphaned encoder.
+            self._force_stop_process()
+            self._unregister_process()
+            raise
 
     def _set_writer_error(self, error):
         if not self._writer_error_event.is_set():
@@ -127,6 +153,27 @@ class FFmpegVideoWriter:
     def _raise_writer_error(self):
         if self._writer_error_event.is_set():
             raise self._writer_error
+
+    def _unregister_process(self):
+        """Remove a finished FFmpeg process from the manager exactly once.
+
+        If even terminate/kill could not stop the real ``Popen`` instance,
+        retain the registration so the application-level process-tree cleanup
+        still gets another chance during shutdown.
+        """
+        poll = getattr(self._process, 'poll', None)
+        if poll is not None:
+            try:
+                if poll() is None:
+                    return False
+            except (OSError, ValueError):
+                return False
+        with self._process_registration_lock:
+            process_id = self._process_registration_id
+            self._process_registration_id = None
+        if process_id is not None and self._process_manager is not None:
+            self._process_manager.remove_process(process_id)
+        return True
 
     def _write_loop(self):
         while True:
@@ -227,6 +274,7 @@ class FFmpegVideoWriter:
                 self._writer_thread.join(
                     timeout=self._FORCE_STOP_TIMEOUT_SECONDS,
                 )
+                self._unregister_process()
                 raise
 
     def release(self):
@@ -348,3 +396,4 @@ class FFmpegVideoWriter:
                 raise
             finally:
                 self._release_complete = True
+                self._unregister_process()

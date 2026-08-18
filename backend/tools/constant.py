@@ -7,6 +7,7 @@ class InpaintMode(Enum):
     """
     STTN_AUTO = "sttn-auto"
     STTN_DET = "sttn-det"
+    FIXED_WATERMARK = "fixed-watermark"
     LAMA = "lama"
     PROPAINTER = "propainter"
     OPENCV = "opencv"

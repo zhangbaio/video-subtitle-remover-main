@@ -5,7 +5,7 @@ import cv2
 import numpy as np
 import torch
 from torchvision import transforms
-from typing import List
+from typing import List, Union
 import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -103,8 +103,11 @@ class STTNDetInpaint:
             split_h = int(W_ori * 5 / 18)
         inpaint_area = get_inpaint_area_by_mask(W_ori, H_ori, split_h, mask)
         # 初始化帧存储变量
-        # 高分辨率帧存储列表（浅拷贝 + 逐帧 copy，避免 deepcopy 开销）
-        frames_hr = [f.copy() for f in input_frames]
+        # Keep caller-owned high-resolution frames read-only during inference.  A
+        # frame is copied only when its final composited result is produced, so
+        # we do not hold an otherwise unused full-resolution duplicate of the
+        # whole batch while STTN is running.
+        frames_hr = input_frames
         frames_scaled = {}  # 存放缩放后帧的字典
         masks_scaled = {}  # 存放缩放后遮罩的字典
         comps = {}  # 存放补全后帧的字典
@@ -112,7 +115,15 @@ class STTNDetInpaint:
         inpainted_frames = []
         for k in range(len(inpaint_area)):
             frames_scaled[k] = []  # 为每个去除部分初始化一个列表
-            masks_scaled[k] = []  # 为每个去除部分初始化一个列表
+            masks_scaled[k] = None
+
+            # The subtitle mask is static for every frame in this STTN batch.
+            # Resize it once per crop instead of once per video frame.
+            mask_crop = mask[inpaint_area[k][0]:inpaint_area[k][1], :, :]
+            masks_scaled[k] = cv2.resize(
+                mask_crop,
+                (self.model_input_width, self.model_input_height),
+            )
 
         # 读取并缩放帧
         for j in range(len(frames_hr)):
@@ -120,11 +131,8 @@ class STTNDetInpaint:
             # 对每个去除部分进行切割和缩放
             for k in range(len(inpaint_area)):
                 image_crop = image[inpaint_area[k][0]:inpaint_area[k][1], :, :]  # 切割
-                mask_crop = mask[inpaint_area[k][0]:inpaint_area[k][1], :, :]  # 切割
                 image_resize = cv2.resize(image_crop, (self.model_input_width, self.model_input_height))  # 缩放
-                mask_resize = cv2.resize(mask_crop, (self.model_input_width, self.model_input_height))  # 缩放
                 frames_scaled[k].append(image_resize)  # 将缩放后的帧添加到对应列表
-                masks_scaled[k].append(mask_resize)  # 将缩放后的遮罩添加到对应列表
 
         # 处理每一个去除部分
         for k in range(len(inpaint_area)):
@@ -134,20 +142,28 @@ class STTNDetInpaint:
         # 如果存在去除部分
         if inpaint_area:
             for j in range(len(frames_hr)):
-                frame = frames_hr[j]  # 取出原始帧
+                frame = frames_hr[j].copy()
                 # 对于模式中的每一个段落
                 for k in range(len(inpaint_area)):
-                    comp = cv2.resize(comps[k][j], (W_ori, split_h))  # 将补全帧缩放回原大小
-                    comp = cv2.cvtColor(comp.astype(np.uint8), cv2.COLOR_BGR2RGB)  # 转换颜色空间
-                    # 获取遮罩区域并进行图像合成
-                    mask_area = mask[inpaint_area[k][0]:inpaint_area[k][1], :]  # 取出遮罩区域
-                    # 实现遮罩区域内的图像融合
-                    frame[inpaint_area[k][0]:inpaint_area[k][1], :, :] = comp
+                    y0, y1 = inpaint_area[k][0], inpaint_area[k][1]
+                    comp = cv2.resize(
+                        comps[k][j],
+                        (W_ori, y1 - y0),
+                    ).astype(np.uint8, copy=False)
+                    # ``inpaint`` returns OpenCV-native BGR frames. Copy only
+                    # pixels covered by the original-resolution subtitle mask;
+                    # replacing the complete STTN crop band would also replace
+                    # untouched pixels after a lossy down/up-scale round trip.
+                    crop = frame[y0:y1, :, :]
+                    mask_area = mask[y0:y1, :, :] > 0
+                    np.copyto(crop, comp, where=mask_area)
                 # 将最终帧添加到列表
                 inpainted_frames.append(frame)
                 # print(f'processing frame, {len(frames_hr) - j} left')
         else:
-            inpainted_frames = frames_hr
+            # Preserve the previous non-mutating API even when the mask contains
+            # no valid inpaint area.
+            inpainted_frames = [frame.copy() for frame in frames_hr]
         return inpainted_frames
 
     @staticmethod
@@ -173,22 +189,62 @@ class STTNDetInpaint:
         # 返回参考帧索引列表
         return ref_index
 
-    def inpaint(self, frames: List[np.ndarray], masks: List[np.ndarray]):
+    def inpaint(
+        self,
+        frames: List[np.ndarray],
+        masks: Union[np.ndarray, List[np.ndarray]],
+    ):
         """
         使用STTN完成空洞填充（空洞即被遮罩的区域）
         """
         frame_length = len(frames)
         # 对帧进行预处理转换为张量，并进行归一化
-        feats = _to_tensors(frames).unsqueeze(0) * 2 - 1
+        # Stack converts list entries to PIL images in-place; pass a shallow list
+        # copy so the original NumPy frames remain available for compositing.
+        feats = _to_tensors(list(frames)).unsqueeze(0) * 2 - 1
 
-        binary_masks = [np.expand_dims((np.array(m) > 0.5).astype(np.uint8), 2) for m in masks]
-        # 将掩码转换为张量
-        masks_tensor = (_to_tensors(masks).unsqueeze(0) > 0.5).float()
+        # The detector path uses one static mask for the complete frame batch.
+        # Keep support for a per-frame mask list, but avoid materialising and
+        # transferring N identical masks in the common static-mask case.
+        static_mask = isinstance(masks, np.ndarray) or len(masks) == 1
+        if static_mask:
+            mask_array = np.asarray(masks if isinstance(masks, np.ndarray) else masks[0])
+            if mask_array.ndim == 3 and mask_array.shape[-1] == 1:
+                mask_array = mask_array[:, :, 0]
+            mask_arrays = [mask_array]
+            binary_masks = [
+                np.expand_dims((mask_array > 0.5).astype(np.uint8), 2)
+            ]
+            masks_tensor = (
+                (_to_tensors(mask_arrays).unsqueeze(0) > 0.5)
+                .float()
+                .to(self.device)
+                .expand(1, frame_length, -1, -1, -1)
+            )
+        else:
+            if len(masks) != frame_length:
+                raise ValueError(
+                    "STTN masks must contain either one static mask or one mask per frame"
+                )
+            mask_arrays = []
+            for current_mask in masks:
+                mask_array = np.asarray(current_mask)
+                if mask_array.ndim == 3 and mask_array.shape[-1] == 1:
+                    mask_array = mask_array[:, :, 0]
+                mask_arrays.append(mask_array)
+            binary_masks = [
+                np.expand_dims((mask_array > 0.5).astype(np.uint8), 2)
+                for mask_array in mask_arrays
+            ]
+            masks_tensor = (
+                (_to_tensors(mask_arrays).unsqueeze(0) > 0.5)
+                .float()
+                .to(self.device)
+            )
 
-        # 把特征张量转移到指定的设备（CPU或GPU）
-        feats, masks_tensor = feats.to(self.device), masks_tensor.to(self.device)
-        # 初始化一个与视频长度相同的列表，用于存储处理完成的帧
-        comp_frames = [None] * frame_length
+        # Move the frame tensor to the selected inference device.
+        feats = feats.to(self.device)
+        prediction_counts = [0] * frame_length
         # 统一关闭梯度计算，用于推理阶段节省内存并加速
         with _cuda_inference_optimizations(self.device), torch.inference_mode():
             # 将处理好的帧通过编码器，产生特征表示
@@ -197,6 +253,19 @@ class STTNDetInpaint:
             _, c, feat_h, feat_w = feats.size()
             # 调整特征形状以匹配模型的期望输入
             feats = feats.view(1, frame_length, c, feat_h, feat_w)
+            # Accumulate overlapping-window predictions on the inference device.
+            # The previous implementation copied every window to the CPU; this
+            # buffer lets the whole batch use a single device-to-host transfer.
+            prediction_accumulator = torch.empty(
+                (
+                    frame_length,
+                    3,
+                    self.model_input_height,
+                    self.model_input_width,
+                ),
+                dtype=torch.float32,
+                device=self.device,
+            )
             # 在设定的邻居帧步幅内循环处理视频
             for f in range(0, frame_length, self.neighbor_stride):
                 # 计算邻近帧的ID
@@ -211,16 +280,42 @@ class STTNDetInpaint:
                 pred_img = torch.tanh(self.model.decoder(pred_feat[:len(neighbor_ids), :, :, :]))
                 # 将结果张量重新缩放到0到255的范围内（图像像素值）
                 pred_img = (pred_img + 1) / 2
-                # 将张量移动回CPU并转为NumPy数组
-                pred_img = pred_img.cpu().permute(0, 2, 3, 1).numpy() * 255
+                # Match NumPy's previous uint8 truncation before merging
+                # overlapping predictions, while keeping the merge on-device.
+                pred_img = pred_img.mul(255).clamp_(0, 255).floor_().float()
                 # 遍历邻近帧
                 for i in range(len(neighbor_ids)):
                     idx = neighbor_ids[i]
-                    # 将预测的图片转换为无符号8位整数格式
-                    img = pred_img[i].astype(np.uint8) * binary_masks[idx] + frames[idx] * (1 - binary_masks[idx])
-                    if comp_frames[idx] is None:
-                        comp_frames[idx] = img
+                    if prediction_counts[idx] == 0:
+                        prediction_accumulator[idx].copy_(pred_img[i])
                     else:
-                        comp_frames[idx] = comp_frames[idx].astype(np.float32) * 0.5 + img.astype(np.float32) * 0.5
+                        prediction_accumulator[idx].mul_(0.5).add_(pred_img[i], alpha=0.5)
+                    prediction_counts[idx] += 1
+
+            # Exactly one D2H transfer for all completed frames in this crop.
+            predictions_cpu = prediction_accumulator.cpu().numpy()
+
+        comp_frames = [None] * frame_length
+        for idx, prediction_count in enumerate(prediction_counts):
+            if prediction_count == 0:
+                continue
+            # STTN predicts RGB tensors, while every OpenCV frame in ``frames``
+            # is BGR. Convert before compositing so the two colour spaces can
+            # never be mixed into a blue/purple full-width crop band.
+            prediction = predictions_cpu[idx].transpose(1, 2, 0)[..., ::-1]
+            binary_mask = binary_masks[0 if static_mask else idx]
+            if prediction_count == 1:
+                # Preserve the old single-prediction uint8 result type.
+                prediction = prediction.astype(np.uint8, copy=False)
+                comp_frames[idx] = (
+                    prediction * binary_mask
+                    + frames[idx] * (1 - binary_mask)
+                )
+            else:
+                # Repeated 50/50 merging produces float32 in the original path.
+                comp_frames[idx] = (
+                    prediction * binary_mask
+                    + frames[idx].astype(np.float32) * (1 - binary_mask)
+                )
         # 返回处理完成的帧序列
         return comp_frames
